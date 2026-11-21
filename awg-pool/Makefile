@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=awg-pool
-PKG_VERSION:=1.1.0
+PKG_VERSION:=1.2.0
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_MAINTAINER:=local build
@@ -19,8 +19,9 @@ endef
 
 define Package/awg-pool/description
   Rotates AWG endpoints across a pool of OpenWrt interfaces. Gates candidates
-  on HTTPS reachability and download throughput. Keeps country diversity.
-  Never modifies Forkop configuration. Leaves no interface down on exit.
+  on HTTPS reachability and download throughput. Configurable TLS ceiling for
+  DPI-affected links. Cross-checks the pool before failing over, so blocked
+  probe addresses do not cause false failover. Never modifies Forkop config.
 endef
 
 define Package/awg-pool/conffiles

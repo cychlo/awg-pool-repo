@@ -106,10 +106,31 @@ return view.extend({
 		num('health_tries', _('Попыток HTTPS после подъёма'), 3, 1, 10);
 		num('health_retry', _('Пауза между попытками, с'), 2, 0, 60);
 
-		var hu = s.option(form.Value, 'health_urls', _('URL проверки доступности'),
-			_('Через пробел. Успех, если любой вернул 200 или 204. Держите адреса на IP, чтобы не зависеть от DNS внутри туннеля.'));
-		hu.placeholder = 'https://1.1.1.1/cdn-cgi/trace https://8.8.8.8/resolve?name=example.com&type=A';
-		hu.optional = true; hu.rmempty = true;
+		var hu = s.option(form.TextValue, 'health_urls', _('Адреса проверки доступности'),
+			_('По одному URL в строке (или через пробел). Успех, если ЛЮБОЙ вернул 200 или 204. Только IP-адреса — резолвинг не нужен. 1.1.1.1 в РФ часто заблокирован DPI: держите его последним или уберите. Запросы 8.8.8.8/8.8.4.4 /resolve — это DoH по IP.'));
+		hu.rows = 5;
+		hu.optional = true;
+		hu.rmempty = true;
+		hu.placeholder = 'https://8.8.8.8/resolve?name=example.com&type=A\nhttps://8.8.4.4/resolve?name=example.com&type=A\nhttps://1.1.1.1/cdn-cgi/trace';
+
+		var tm = s.option(form.ListValue, 'tls_max', _('Максимальная версия TLS'),
+			_('DPI в РФ часто ломает TLS 1.3 — значение 1.2 решает это. «Без ограничения» = curl согласует максимум.'));
+		tm.value('1.2', 'TLS 1.2 (рекомендуется для РФ)');
+		tm.value('1.3', 'TLS 1.3');
+		tm.value('1.1', 'TLS 1.1');
+		tm.value('1.0', 'TLS 1.0');
+		tm.value('auto', 'Без ограничения');
+		tm.optional = true;
+		tm.rmempty = true;
+		tm.placeholder = '1.2';
+
+		var cc = s.option(form.ListValue, 'cross_check', _('Не перебирать, если не отвечает ни один интерфейс'),
+			_('Защита от ложного отказа: при блокировке проверочных адресов все туннели выглядели бы мёртвыми. Действует при ≥2 интерфейсах в пуле.'));
+		cc.value('1', 'Включено (рекомендуется)');
+		cc.value('0', 'Выключено');
+		cc.optional = true;
+		cc.rmempty = true;
+		cc.placeholder = '1';
 
 		num('min_speed_kbps', _('Порог скорости, КБ/с'), 200, 1, 1000000,
 		    _('КилоБАЙТЫ в секунду: 200 ≈ 1.6 Мбит/с, 2500 ≈ 20 Мбит/с. Не ставьте выше реальной скорости канала.'));
@@ -123,7 +144,14 @@ return view.extend({
 			_('Путь /__down?bytes= зашит в скрипт и специфичен для Cloudflare. Произвольный хост подставлять нельзя.'));
 		sh.placeholder = 'speed.cloudflare.com';
 		sh.datatype = 'hostname';
-		sh.optional = true; sh.rmempty = true;
+		sh.optional = true;
+		sh.rmempty = true;
+
+		var si = s.option(form.Value, 'speed_ip', _('IP сервера замера скорости'),
+			_('Пусто = определять через WAN по имени. Задайте IP, если DNS роутера ненадёжен. Узнать: curl -4 -s -o /dev/null -w "%{remote_ip}" --tls-max 1.2 https://speed.cloudflare.com/__down?bytes=1'));
+		si.datatype = 'ip4addr';
+		si.optional = true;
+		si.rmempty = true;
 
 		num('sweep_cooldown', _('Пауза между переборами, с'), 90, 0, 86400,
 		    _('Защищает рабочий интерфейс от «дёрганья». На резервы не действует.'));

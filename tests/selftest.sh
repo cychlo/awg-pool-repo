@@ -62,7 +62,7 @@ setsc(){ _b=""; while IFS= read -r l; do case "$l" in "$1="*) continue;; esac; _
 
 curl(){ _d=""; _f=""; _u=""
  while [ $# -gt 0 ]; do case "$1" in --interface) _d="$2"; shift 2;; -w|--write-out) _f="$2"; shift 2;;
-   -o|--output|--resolve|--connect-timeout|--max-time) shift 2;; http*) _u="$1"; shift;; *) shift;; esac; done
+   -o|--output|--resolve|--connect-timeout|--max-time|--tls-max) shift 2;; http*) _u="$1"; shift;; *) shift;; esac; done
  _e(){ case "$_f" in '%{http_code}') printf '%s' "$1";; '%{remote_ip}') printf '104.16.132.229';; *) printf '%s %s %s' "$1" "$2" "$3";; esac; }
  if [ "$_d" = "$(ng wan)" ]; then [ "$(ng wan_down)" = 1 ] && { _e 000 0 0; return 7; }; _e 200 0 0; return 0; fi
  _hr=0; _ht=0
@@ -159,6 +159,12 @@ ok "резервы не тронуты" "$(cur_host awg1)/$(cur_host awg2)" "pl.
 reset; preflight >/dev/null 2>&1; bring_up_pool; ns wan_down 1
 ( cmd_once ) >/dev/null 2>&1; rc=$?
 ok "WAN down: без смены" "$rc/$(cur_host awg0)" "0/it.gw.test"
+
+reset; preflight >/dev/null 2>&1; bring_up_pool
+for c in it pl de ie no; do setsc "$c.gw.test" "000 0"; done
+ok "cross-check: ни один не отвечает" "$(pool_healthy && echo 1 || echo 0)" "0"
+setsc pl.gw.test "200 5000000"
+ok "cross-check: резерв отвечает" "$(pool_healthy && echo 1 || echo 0)" "1"
 
 printf '\nИТОГО PASS=%s FAIL=%s\n' "$P" "$F"
 [ "$F" = 0 ] || exit 1

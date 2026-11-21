@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-awg-pool
-PKG_VERSION:=1.1.0
+PKG_VERSION:=1.2.0
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_MAINTAINER:=local build
@@ -20,8 +20,9 @@ endef
 
 define Package/luci-app-awg-pool/description
   Adds Services -> AWG Failover page: service control, autostart toggle,
-  live status and editing of all awg-pool parameters, pool interfaces and
-  country list. Grants write access only to the awg-failover UCI package.
+  live status and editing of all awg-pool parameters including probe URLs,
+  TLS ceiling and DPI cross-check, pool interfaces and country list.
+  Grants write access only to the awg-failover UCI package.
 endef
 
 define Build/Configure

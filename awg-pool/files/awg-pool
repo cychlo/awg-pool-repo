@@ -1,6 +1,6 @@
 #!/bin/sh
 # =============================================================================
-# awg-pool 1.1 -- пул AWG-интерфейсов OpenWrt: ротация стран по скорости
+# awg-pool 1.2 -- пул AWG-интерфейсов OpenWrt: ротация стран по скорости
 # OpenWrt 25.12.x, Forkop 2.0 (группа Fallback над интерфейсами секции)
 #
 # Forkop Fallback -- доступность и мгновенное переключение между интерфейсами
@@ -12,8 +12,10 @@
 #   * у каждого интерфейса ровно один peer, свой клиентский ключ, свой Address
 #   * страны у членов пула не повторяются
 #   * при выходе ни один интерфейс не остаётся погашенным
+#   * если не отвечает НИ ОДИН интерфейс -- перебор не запускается (защита
+#     от ложного отказа при блокировке проверочных адресов через DPI)
 # =============================================================================
-VERSION="1.1"
+VERSION="1.2"
 CFG="awg-failover"
 LOG_TAG="awg-pool"
 
@@ -27,7 +29,10 @@ SPEED_BYTES=2000000
 SPEED_WINDOW=8
 MIN_SPEED_KBPS=200
 SPEED_HOST="speed.cloudflare.com"
-HEALTH_URLS="https://1.1.1.1/cdn-cgi/trace https://8.8.8.8/resolve?name=example.com&type=A"
+SPEED_IP_FIXED=""
+TLS_MAX="1.2"
+CROSS_CHECK=1
+HEALTH_URLS="https://8.8.8.8/resolve?name=example.com&type=A https://8.8.4.4/resolve?name=example.com&type=A https://1.1.1.1/cdn-cgi/trace"
 SWEEP_COOLDOWN=90
 DEAD_TTL=600
 STANDBY_EVERY=15
@@ -39,6 +44,7 @@ LOCK="/var/run/awg-pool.lock"
 
 POOL=""; POOL_N=0; SERVERS=""; SERVER_N=0; POOL_IFACES=""
 SPEED_IP=""; WAN_CACHED=""; RUNNING=1; NAP_PID=""; QUIET=0; LAST_SPEED=0
+TLS_FLAGS="--tls-max 1.2"
 
 _lg() {
 	logger -t "$LOG_TAG" -p "daemon.$1" "$3" 2>/dev/null
@@ -64,6 +70,7 @@ load_config() {
 		          HEALTH_RETRY:health_retry SPEED_EVERY:speed_every \
 		          SPEED_BYTES:speed_bytes SPEED_WINDOW:speed_window \
 		          MIN_SPEED_KBPS:min_speed_kbps SPEED_HOST:speed_host \
+		          SPEED_IP_FIXED:speed_ip TLS_MAX:tls_max CROSS_CHECK:cross_check \
 		          HEALTH_URLS:health_urls SWEEP_COOLDOWN:sweep_cooldown \
 		          DEAD_TTL:dead_ttl STANDBY_EVERY:standby_every MAX_TRIES:max_tries \
 		          PROBE_CHECK_EVERY:probe_check_every WAN_REFRESH_EVERY:wan_refresh_every; do
@@ -74,9 +81,24 @@ load_config() {
 	fi
 	for _n in $CHECK_INTERVAL $FAIL_THRESHOLD $HEALTH_TIMEOUT $HEALTH_TRIES $HEALTH_RETRY \
 	          $SPEED_EVERY $SPEED_BYTES $SPEED_WINDOW $MIN_SPEED_KBPS $SWEEP_COOLDOWN \
-	          $DEAD_TTL $STANDBY_EVERY $MAX_TRIES $PROBE_CHECK_EVERY $WAN_REFRESH_EVERY; do
+	          $DEAD_TTL $STANDBY_EVERY $MAX_TRIES $PROBE_CHECK_EVERY $WAN_REFRESH_EVERY \
+	          $CROSS_CHECK; do
 		is_num "$_n" || { loge "Некорректное число в $CFG.main: '$_n'"; return 1; }
 	done
+	case "$TLS_MAX" in
+		auto|1.0|1.1|1.2|1.3) : ;;
+		*) loge "tls_max должен быть auto|1.0|1.1|1.2|1.3"; return 1 ;;
+	esac
+	case "$SPEED_HOST" in
+		''|*[!A-Za-z0-9.-]*) loge "speed_host: недопустимые символы"; return 1 ;;
+	esac
+	if [ -n "$SPEED_IP_FIXED" ]; then
+		case "$SPEED_IP_FIXED" in
+			*[!0-9.]*) loge "speed_ip должен быть IPv4-адресом"; return 1 ;;
+		esac
+	fi
+	TLS_FLAGS=""
+	[ "$TLS_MAX" = auto ] || TLS_FLAGS="--tls-max $TLS_MAX"
 	[ "$CHECK_INTERVAL" -ge 5 ] || CHECK_INTERVAL=5
 	[ "$FAIL_THRESHOLD" -ge 1 ] || FAIL_THRESHOLD=1
 	[ "$PROBE_CHECK_EVERY" -ge 1 ] || PROBE_CHECK_EVERY=1
@@ -190,22 +212,31 @@ wan_dev() {
 	WAN_CACHED="$(ip -4 route show table main 2>/dev/null | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
 	printf '%s' "$WAN_CACHED"
 }
+# set -f вокруг циклов по URL: в адресах есть '?', исключаем globbing
 wan_ok() {
 	_w="$(wan_dev)"
 	[ -n "$_w" ] || return 0
 	case " $POOL_IFACES " in *" $_w "*) return 0 ;; esac
+	set -f; _rc=1
 	for _u in $HEALTH_URLS; do
-		_c="$(curl -4 -s -o /dev/null -w '%{http_code}' --interface "$_w" --connect-timeout 5 --max-time 8 "$_u" 2>/dev/null)"
-		case "$_c" in 200|204) return 0 ;; esac
+		# shellcheck disable=SC2086
+		_c="$(curl -4 -s -o /dev/null $TLS_FLAGS -w '%{http_code}' --interface "$_w" \
+		       --connect-timeout 5 --max-time 8 "$_u" 2>/dev/null)"
+		case "$_c" in 200|204) _rc=0; break ;; esac
 	done
-	return 1
+	set +f
+	return "$_rc"
 }
 health() {
+	set -f; _rc=1
 	for _u in $HEALTH_URLS; do
-		_c="$(curl -4 -s -o /dev/null -w '%{http_code}' --interface "$1" --connect-timeout "$HEALTH_TIMEOUT" --max-time "$HEALTH_TIMEOUT" "$_u" 2>/dev/null)"
-		case "$_c" in 200|204) return 0 ;; esac
+		# shellcheck disable=SC2086
+		_c="$(curl -4 -s -o /dev/null $TLS_FLAGS -w '%{http_code}' --interface "$1" \
+		       --connect-timeout "$HEALTH_TIMEOUT" --max-time "$HEALTH_TIMEOUT" "$_u" 2>/dev/null)"
+		case "$_c" in 200|204) _rc=0; break ;; esac
 	done
-	return 1
+	set +f
+	return "$_rc"
 }
 health_retry() {
 	_k=0
@@ -216,20 +247,28 @@ health_retry() {
 	done
 	return 1
 }
+pool_healthy() {
+	for _f in $POOL_IFACES; do health "$_f" && return 0; done
+	return 1
+}
 speed_ip_refresh() {
 	_w="$(wan_dev)"; [ -n "$_w" ] || return 1
-	_ip="$(curl -4 -s -o /dev/null --interface "$_w" --connect-timeout 5 --max-time 8 -w '%{remote_ip}' "https://$SPEED_HOST/__down?bytes=1" 2>/dev/null)"
+	# shellcheck disable=SC2086
+	_ip="$(curl -4 -s -o /dev/null $TLS_FLAGS --interface "$_w" --connect-timeout 5 \
+	        --max-time 8 -w '%{remote_ip}' "https://$SPEED_HOST/__down?bytes=1" 2>/dev/null)"
 	case "$_ip" in *.*.*.*) SPEED_IP="$_ip"; return 0 ;; esac
 	return 1
 }
 speed() {
+	[ -n "$SPEED_IP_FIXED" ] && SPEED_IP="$SPEED_IP_FIXED"
 	[ -n "$SPEED_IP" ] || speed_ip_refresh || true
-	_u="https://$SPEED_HOST/__down?bytes=$SPEED_BYTES"
-	if [ -n "$SPEED_IP" ]; then
-		_o="$(curl -4 -s -o /dev/null --interface "$1" --resolve "$SPEED_HOST:443:$SPEED_IP" --connect-timeout 5 --max-time "$SPEED_WINDOW" -w '%{http_code} %{speed_download} %{size_download}' "$_u" 2>/dev/null)"
-	else
-		_o="$(curl -4 -s -o /dev/null --interface "$1" --connect-timeout 5 --max-time "$SPEED_WINDOW" -w '%{http_code} %{speed_download} %{size_download}' "$_u" 2>/dev/null)"
-	fi
+	_res=""
+	[ -n "$SPEED_IP" ] && _res="--resolve $SPEED_HOST:443:$SPEED_IP"
+	# shellcheck disable=SC2086
+	_o="$(curl -4 -s -o /dev/null $TLS_FLAGS $_res --interface "$1" \
+	       --connect-timeout 5 --max-time "$SPEED_WINDOW" \
+	       -w '%{http_code} %{speed_download} %{size_download}' \
+	       "https://$SPEED_HOST/__down?bytes=$SPEED_BYTES" 2>/dev/null)"
 	# curl exit 28 (обрыв по окну) НЕ отказ: скорость измерена
 	# shellcheck disable=SC2086
 	set -- $_o
@@ -375,7 +414,7 @@ preflight() {
 		pick_probe "$_if" || { loge "$_if: нет свободной таблицы/приоритета для проверок"; return 1; }
 		_i=$((_i + 1))
 	done
-	log "Старт v$VERSION пул:$POOL_IFACES стран=$SERVER_N порог=${MIN_SPEED_KBPS}KB/s"
+	log "Старт v$VERSION пул:$POOL_IFACES стран=$SERVER_N порог=${MIN_SPEED_KBPS}KB/s TLS=${TLS_MAX}"
 	return 0
 }
 
@@ -409,6 +448,8 @@ cmd_status() {
 	load_config || { echo "Пул не настроен: нужны >=1 секция pool и >=2 server в $CFG"; return 1; }
 	printf 'awg-pool %s\n' "$VERSION"
 	printf 'порог скорости : %s KB/s\n' "$MIN_SPEED_KBPS"
+	printf 'макс. TLS      : %s\n' "$TLS_MAX"
+	printf 'cross-check    : %s\n' "$CROSS_CHECK"
 	printf 'стран в пуле   : %s\n' "$SERVER_N"
 	_i=0
 	while [ "$_i" -lt "$POOL_N" ]; do
@@ -439,6 +480,10 @@ cmd_once() {
 	_p="$(pool_iface 0)"
 	if health "$_p" && speed "$_p"; then
 		mark_good "$(cur_host "$_p")"; log "$_p исправен (${LAST_SPEED} KB/s)"; exit 0
+	fi
+	if [ "$CROSS_CHECK" = 1 ] && [ "$POOL_N" -gt 1 ] && ! pool_healthy; then
+		logw "Ни один интерфейс пула не отвечает. Вероятна блокировка проверочных адресов или отказ WAN — перебор пропущен. Проверьте health_urls и tls_max."
+		exit 0
 	fi
 	mark_dead "$(cur_host "$_p")"
 	rotate "$_p"; exit $?
@@ -493,6 +538,11 @@ cmd_daemon() {
 			_fails=$((_fails + 1))
 			logw "$_p: проверка не пройдена ($_fails/$FAIL_THRESHOLD)"
 			if [ "$_fails" -ge "$FAIL_THRESHOLD" ]; then
+				if [ "$CROSS_CHECK" = 1 ] && [ "$POOL_N" -gt 1 ] && ! pool_healthy; then
+					logw "Ни один интерфейс пула не отвечает. Вероятна блокировка проверочных адресов или отказ WAN — перебор пропущен, трафик не переключаю. Проверьте health_urls и tls_max."
+					_fails=0
+					nap "$CHECK_INTERVAL"; continue
+				fi
 				if [ $((_now - _last_sweep)) -lt "$SWEEP_COOLDOWN" ]; then
 					logw "пауза перед перебором"
 				else
