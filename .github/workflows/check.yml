@@ -10,12 +10,24 @@ jobs:
   lint-and-selftest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y dash shellcheck
+
+      - name: Line endings must be LF
+        run: |
+          bad=0
+          for f in awg-pool/files/awg-pool awg-pool/files/awg-pool.init \
+                   awg-pool/files/awg-failover.config awg-pool/Makefile \
+                   luci-app-awg-pool/Makefile luci-app-awg-pool/files/main.js \
+                   luci-app-awg-pool/files/menu.json luci-app-awg-pool/files/acl.json \
+                   tests/selftest.sh; do
+            if grep -qU $'\r' "$f"; then echo "CRLF: $f"; bad=1; fi
+          done
+          [ "$bad" = 0 ] || { echo "Нормализуйте: git add --renormalize ."; exit 1; }
 
       - name: Shell syntax (dash)
         run: |
@@ -41,7 +53,6 @@ jobs:
           grep -q '"awg-failover"' luci-app-awg-pool/files/acl.json
           grep -q '/etc/config/awg-failover' awg-pool/Makefile
           grep -q '"path": "awg-pool/main"' luci-app-awg-pool/files/menu.json
-          test -f luci-app-awg-pool/files/main.js
           grep -q '"luci-app-awg-pool"' luci-app-awg-pool/files/menu.json
           grep -q '^PKGARCH:=all' awg-pool/Makefile
           grep -q '^PKGARCH:=all' luci-app-awg-pool/Makefile
