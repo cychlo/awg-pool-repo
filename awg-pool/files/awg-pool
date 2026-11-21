@@ -1,0 +1,522 @@
+#!/bin/sh
+# =============================================================================
+# awg-pool 1.1 -- пул AWG-интерфейсов OpenWrt: ротация стран по скорости
+# OpenWrt 25.12.x, Forkop 2.0 (группа Fallback над интерфейсами секции)
+#
+# Forkop Fallback -- доступность и мгновенное переключение между интерфейсами
+# этот скрипт     -- выбор страны по реальной скорости, разнообразие пула,
+#                    обслуживание резервов; конфигурацию Forkop НЕ трогает
+#
+# Инварианты:
+#   * поднят ровно каждый интерфейс пула, ни одного лишнего (слоты провайдера)
+#   * у каждого интерфейса ровно один peer, свой клиентский ключ, свой Address
+#   * страны у членов пула не повторяются
+#   * при выходе ни один интерфейс не остаётся погашенным
+# =============================================================================
+VERSION="1.1"
+CFG="awg-failover"
+LOG_TAG="awg-pool"
+
+CHECK_INTERVAL=20
+FAIL_THRESHOLD=3
+HEALTH_TIMEOUT=5
+HEALTH_TRIES=3
+HEALTH_RETRY=2
+SPEED_EVERY=30
+SPEED_BYTES=2000000
+SPEED_WINDOW=8
+MIN_SPEED_KBPS=200
+SPEED_HOST="speed.cloudflare.com"
+HEALTH_URLS="https://1.1.1.1/cdn-cgi/trace https://8.8.8.8/resolve?name=example.com&type=A"
+SWEEP_COOLDOWN=90
+DEAD_TTL=600
+STANDBY_EVERY=15
+MAX_TRIES=4
+PROBE_CHECK_EVERY=5
+WAN_REFRESH_EVERY=15
+STATE="/var/run/awg-pool.state"
+LOCK="/var/run/awg-pool.lock"
+
+POOL=""; POOL_N=0; SERVERS=""; SERVER_N=0; POOL_IFACES=""
+SPEED_IP=""; WAN_CACHED=""; RUNNING=1; NAP_PID=""; QUIET=0; LAST_SPEED=0
+
+_lg() {
+	logger -t "$LOG_TAG" -p "daemon.$1" "$3" 2>/dev/null
+	[ "$QUIET" = 1 ] || printf '%s [%s] %s\n' "$(date '+%F %T')" "$2" "$3"
+}
+log() { _lg info INFO "$*"; }
+logw() { _lg warn WARN "$*"; }
+loge() { _lg err ERROR "$*"; }
+die() { loge "$*"; exit 1; }
+is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+valid_name() { case "$1" in ''|*[!A-Za-z0-9_]*) return 1 ;; *) return 0 ;; esac; }
+
+sections_of() { uci -q show "$1" 2>/dev/null | sed -n "s/^$1\.\(.*\)=$2\$/\1/p"; }
+nth() { printf '%s\n' "$1" | sed -n "$(($2 + 1))p"; }
+count_lines() { printf '%s' "$1" | grep -c '^'; }
+pget() { uci -q get "network.$1.$2" 2>/dev/null; }
+sget() { uci -q get "$CFG.$1.$2" 2>/dev/null; }
+
+load_config() {
+	if uci -q get "$CFG.main" >/dev/null 2>&1; then
+		for _p in CHECK_INTERVAL:check_interval FAIL_THRESHOLD:fail_threshold \
+		          HEALTH_TIMEOUT:health_timeout HEALTH_TRIES:health_tries \
+		          HEALTH_RETRY:health_retry SPEED_EVERY:speed_every \
+		          SPEED_BYTES:speed_bytes SPEED_WINDOW:speed_window \
+		          MIN_SPEED_KBPS:min_speed_kbps SPEED_HOST:speed_host \
+		          HEALTH_URLS:health_urls SWEEP_COOLDOWN:sweep_cooldown \
+		          DEAD_TTL:dead_ttl STANDBY_EVERY:standby_every MAX_TRIES:max_tries \
+		          PROBE_CHECK_EVERY:probe_check_every WAN_REFRESH_EVERY:wan_refresh_every; do
+			_v="${_p%%:*}"; _o="${_p##*:}"
+			_val="$(uci -q get "$CFG.main.$_o" 2>/dev/null)"
+			[ -n "$_val" ] && eval "$_v=\$_val"
+		done
+	fi
+	for _n in $CHECK_INTERVAL $FAIL_THRESHOLD $HEALTH_TIMEOUT $HEALTH_TRIES $HEALTH_RETRY \
+	          $SPEED_EVERY $SPEED_BYTES $SPEED_WINDOW $MIN_SPEED_KBPS $SWEEP_COOLDOWN \
+	          $DEAD_TTL $STANDBY_EVERY $MAX_TRIES $PROBE_CHECK_EVERY $WAN_REFRESH_EVERY; do
+		is_num "$_n" || { loge "Некорректное число в $CFG.main: '$_n'"; return 1; }
+	done
+	[ "$CHECK_INTERVAL" -ge 5 ] || CHECK_INTERVAL=5
+	[ "$FAIL_THRESHOLD" -ge 1 ] || FAIL_THRESHOLD=1
+	[ "$PROBE_CHECK_EVERY" -ge 1 ] || PROBE_CHECK_EVERY=1
+	[ "$WAN_REFRESH_EVERY" -ge 1 ] || WAN_REFRESH_EVERY=1
+	POOL="$(sections_of "$CFG" pool)"; POOL_N="$(count_lines "$POOL")"
+	SERVERS="$(sections_of "$CFG" server)"; SERVER_N="$(count_lines "$SERVERS")"
+	[ "$POOL_N" -ge 1 ] || return 1
+	[ "$SERVER_N" -ge 2 ] || return 1
+	return 0
+}
+
+pool_iface() { sget "$(nth "$POOL" "$1")" iface; }
+srv_host() { sget "$(nth "$SERVERS" "$1")" host; }
+srv_port() { _p="$(sget "$(nth "$SERVERS" "$1")" port)"; printf '%s' "${_p:-443}"; }
+
+peer_type() {
+	for _t in "amneziawg_$1" "wireguard_$1"; do
+		if uci -q show network 2>/dev/null | grep -q "=$_t\$"; then printf '%s' "$_t"; return 0; fi
+	done
+	return 1
+}
+set_pr() { eval "PR_$1=\$2"; }
+get_pr() { eval "printf '%s' \"\${PR_$1:-}\""; }
+peer_ref() {
+	_c="$(get_pr "$1")"
+	[ -n "$_c" ] && { printf '%s' "$_c"; return 0; }
+	_t="$(peer_type "$1")" || return 1
+	_c="$(sections_of network "$_t" | head -n1)"
+	[ -n "$_c" ] || return 1
+	set_pr "$1" "$_c"
+	printf '%s' "$_c"
+}
+peer_count() { _t="$(peer_type "$1")" || { echo 0; return; }; count_lines "$(sections_of network "$_t")"; }
+cur_host() { pget "$(peer_ref "$1")" endpoint_host; }
+
+used_hosts() {
+	_i=0
+	while [ "$_i" -lt "$POOL_N" ]; do
+		[ "$1" = "$(pool_iface "$_i")" ] || cur_host "$(pool_iface "$_i")"
+		_i=$((_i + 1))
+	done
+}
+
+iface_addr() { ip -4 -o addr show dev "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1; }
+tbl_for() { ip rule show 2>/dev/null | sed -n "s/.*oif $1 .*lookup \([0-9][0-9]*\).*/\1/p" | head -n1; }
+set_pt() { eval "PT_$1=\$2"; }
+get_pt() { eval "printf '%s' \"\${PT_$1:-}\""; }
+set_pp() { eval "PP_$1=\$2"; }
+get_pp() { eval "printf '%s' \"\${PP_$1:-}\""; }
+
+pick_probe() {
+	_if="$1"
+	[ -n "$(get_pt "$_if")" ] && return 0
+	_used="$( { cat /etc/iproute2/rt_tables 2>/dev/null; cat /etc/iproute2/rt_tables.d/* 2>/dev/null; } | awk '$1 ~ /^[0-9]+$/ {print $1}' )"
+	_i=0
+	while [ "$_i" -lt "$POOL_N" ]; do
+		_o="$(pool_iface "$_i")"
+		[ "$_o" = "$_if" ] || _used="$_used
+$(get_pt "$_o")"
+		_i=$((_i + 1))
+	done
+	for _t in 250 251 252 240 241 242 9990 9991 9992; do
+		case "$_t" in 0|253|254|255) continue ;; esac
+		printf '%s\n' "$_used" | grep -qx "$_t" && continue
+		[ -n "$(ip route show table "$_t" 2>/dev/null)" ] && continue
+		set_pt "$_if" "$_t"; break
+	done
+	[ -n "$(get_pt "$_if")" ] || return 1
+	_rules="$(ip rule show 2>/dev/null)"
+	for _p in 200 201 202 210 211 212 220 221; do
+		printf '%s\n' "$_rules" | grep -q "^$_p:" && continue
+		_i=0; _taken=0
+		while [ "$_i" -lt "$POOL_N" ]; do
+			_o="$(pool_iface "$_i")"
+			[ "$(get_pp "$_o")" = "$_p" ] && _taken=1
+			_i=$((_i + 1))
+		done
+		[ "$_taken" = 1 ] && continue
+		set_pp "$_if" "$_p"; return 0
+	done
+	return 1
+}
+probe_up() {
+	_if="$1"; pick_probe "$_if" || return 1
+	_t="$(get_pt "$_if")"; _p="$(get_pp "$_if")"; _a="$(iface_addr "$_if")"
+	[ -n "$_a" ] || return 1
+	ip route replace default dev "$_if" src "$_a" table "$_t" 2>/dev/null || return 1
+	if ! ip rule show 2>/dev/null | grep -q "oif $_if .*lookup $_t"; then
+		ip rule del oif "$_if" lookup "$_t" 2>/dev/null
+		ip rule add oif "$_if" lookup "$_t" priority "$_p" 2>/dev/null || return 1
+	fi
+	return 0
+}
+probe_down() {
+	_if="$1"; _t="$(get_pt "$_if")"
+	[ -n "$_t" ] || return 0
+	ip rule del oif "$_if" lookup "$_t" 2>/dev/null
+	ip route flush table "$_t" 2>/dev/null
+	return 0
+}
+probe_ok() {
+	_if="$1"; _t="$(get_pt "$_if")"
+	[ -n "$_t" ] || return 1
+	ip rule show 2>/dev/null | grep -q "oif $_if .*lookup $_t" || return 1
+	ip route show table "$_t" 2>/dev/null | grep -q "dev $_if" || return 1
+	return 0
+}
+
+wan_dev() {
+	[ -n "$WAN_CACHED" ] && { printf '%s' "$WAN_CACHED"; return 0; }
+	WAN_CACHED="$(ip -4 route show table main 2>/dev/null | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+	printf '%s' "$WAN_CACHED"
+}
+wan_ok() {
+	_w="$(wan_dev)"
+	[ -n "$_w" ] || return 0
+	case " $POOL_IFACES " in *" $_w "*) return 0 ;; esac
+	for _u in $HEALTH_URLS; do
+		_c="$(curl -4 -s -o /dev/null -w '%{http_code}' --interface "$_w" --connect-timeout 5 --max-time 8 "$_u" 2>/dev/null)"
+		case "$_c" in 200|204) return 0 ;; esac
+	done
+	return 1
+}
+health() {
+	for _u in $HEALTH_URLS; do
+		_c="$(curl -4 -s -o /dev/null -w '%{http_code}' --interface "$1" --connect-timeout "$HEALTH_TIMEOUT" --max-time "$HEALTH_TIMEOUT" "$_u" 2>/dev/null)"
+		case "$_c" in 200|204) return 0 ;; esac
+	done
+	return 1
+}
+health_retry() {
+	_k=0
+	while [ "$_k" -lt "$HEALTH_TRIES" ]; do
+		health "$1" && return 0
+		_k=$((_k + 1))
+		[ "$_k" -lt "$HEALTH_TRIES" ] && [ "$RUNNING" = 1 ] && sleep "$HEALTH_RETRY"
+	done
+	return 1
+}
+speed_ip_refresh() {
+	_w="$(wan_dev)"; [ -n "$_w" ] || return 1
+	_ip="$(curl -4 -s -o /dev/null --interface "$_w" --connect-timeout 5 --max-time 8 -w '%{remote_ip}' "https://$SPEED_HOST/__down?bytes=1" 2>/dev/null)"
+	case "$_ip" in *.*.*.*) SPEED_IP="$_ip"; return 0 ;; esac
+	return 1
+}
+speed() {
+	[ -n "$SPEED_IP" ] || speed_ip_refresh || true
+	_u="https://$SPEED_HOST/__down?bytes=$SPEED_BYTES"
+	if [ -n "$SPEED_IP" ]; then
+		_o="$(curl -4 -s -o /dev/null --interface "$1" --resolve "$SPEED_HOST:443:$SPEED_IP" --connect-timeout 5 --max-time "$SPEED_WINDOW" -w '%{http_code} %{speed_download} %{size_download}' "$_u" 2>/dev/null)"
+	else
+		_o="$(curl -4 -s -o /dev/null --interface "$1" --connect-timeout 5 --max-time "$SPEED_WINDOW" -w '%{http_code} %{speed_download} %{size_download}' "$_u" 2>/dev/null)"
+	fi
+	# curl exit 28 (обрыв по окну) НЕ отказ: скорость измерена
+	# shellcheck disable=SC2086
+	set -- $_o
+	[ "$#" -ge 3 ] || { LAST_SPEED=0; return 1; }
+	_c="$1"; _s="${2%%.*}"; _z="${3%%.*}"
+	case "$_s" in ''|*[!0-9]*) _s=0 ;; esac
+	case "$_z" in ''|*[!0-9]*) _z=0 ;; esac
+	LAST_SPEED=$((_s / 1024))
+	[ "$_c" = 200 ] || return 1
+	[ "$_z" -gt 0 ] || return 1
+	[ "$LAST_SPEED" -ge "$MIN_SPEED_KBPS" ]
+}
+
+st_get() { [ -f "$STATE" ] && sed -n "s/^$1=//p" "$STATE" 2>/dev/null | head -n1; }
+st_set() {
+	_tmp="$STATE.$$"
+	{ [ -f "$STATE" ] && grep -v "^$1=" "$STATE" 2>/dev/null; printf '%s=%s\n' "$1" "$2"; } > "$_tmp" && mv -f "$_tmp" "$STATE"
+	rm -f "$_tmp" 2>/dev/null
+}
+host_key() { printf '%s' "$1" | tr '.' '_'; }
+mark_good() { st_set "speed_$(host_key "$1")" "$LAST_SPEED"; st_set "dead_$(host_key "$1")" 0; }
+mark_dead() { st_set "dead_$(host_key "$1")" "$(( $(date +%s) + DEAD_TTL ))"; }
+host_dead() { _d="$(st_get "dead_$(host_key "$1")")"; [ -n "$_d" ] && [ "$_d" -gt "$(date +%s)" ]; }
+clear_dead() {
+	[ -f "$STATE" ] || return 0
+	_tmp="$STATE.$$"
+	grep -v '^dead_' "$STATE" > "$_tmp" 2>/dev/null && mv -f "$_tmp" "$STATE"
+	rm -f "$_tmp" 2>/dev/null
+	return 0
+}
+
+candidates() {
+	_excl="$(used_hosts "$1")"; _i=0; _list=""; _now="$(date +%s)"
+	while [ "$_i" -lt "$SERVER_N" ]; do
+		_h="$(srv_host "$_i")"
+		if [ -n "$_h" ] && ! printf '%s\n' "$_excl" | grep -qx "$_h"; then
+			_d="$(st_get "dead_$(host_key "$_h")")"
+			if [ -z "$_d" ] || [ "$_d" -le "$_now" ]; then
+				_sc="$(st_get "speed_$(host_key "$_h")")"
+				[ -n "$_sc" ] || _sc=999999
+				_list="$_list$_sc $_h
+"
+			fi
+		fi
+		_i=$((_i + 1))
+	done
+	printf '%s' "$_list" | sort -rn | awk '{print $2}'
+	return 0
+}
+
+apply_host() {
+	_if="$1"; _h="$2"; _r="$(peer_ref "$_if")"; _p=443
+	[ -n "$_r" ] || return 1
+	_i=0
+	while [ "$_i" -lt "$SERVER_N" ]; do
+		[ "$(srv_host "$_i")" = "$_h" ] && _p="$(srv_port "$_i")"
+		_i=$((_i + 1))
+	done
+	if [ "$(pget "$_r" endpoint_host)" = "$_h" ] && \
+	   [ "$(pget "$_r" endpoint_port)" = "$_p" ] && \
+	   [ "$(pget "$_r" disabled)" != 1 ]; then
+		return 0
+	fi
+	{ printf 'set network.%s.endpoint_host=%s\n' "$_r" "$_h"
+	  printf 'set network.%s.endpoint_port=%s\n' "$_r" "$_p"
+	  printf 'set network.%s.disabled=0\n' "$_r"
+	  printf 'commit network\n'; } | uci -q batch >/dev/null 2>&1
+}
+wait_up() {
+	_k=0
+	while [ "$_k" -lt 20 ]; do
+		ip link show dev "$1" >/dev/null 2>&1 && [ -n "$(iface_addr "$1")" ] && return 0
+		sleep 1; _k=$((_k + 1))
+	done
+	return 1
+}
+bounce() {
+	ifdown "$1" >/dev/null 2>&1
+	_k=0
+	while [ "$_k" -lt 10 ]; do
+		ip link show dev "$1" >/dev/null 2>&1 || break
+		[ -n "$(iface_addr "$1")" ] || break
+		sleep 1; _k=$((_k + 1))
+	done
+	ifup "$1" >/dev/null 2>&1
+	wait_up "$1" || { loge "$1 не поднялся"; return 1; }
+	probe_up "$1" || { loge "$1: проверочный маршрут не создан (apk add ip-full)"; return 1; }
+	probe_ok "$1"
+}
+
+rotate() {
+	_if="$1"; _tries=0
+	_cands="$(candidates "$_if")"
+	if [ -z "$_cands" ]; then
+		logw "$_if: свободных стран нет, сбрасываю cooldown"
+		clear_dead
+		_cands="$(candidates "$_if")"
+	fi
+	[ -n "$_cands" ] || { logw "$_if: список стран пуст"; return 1; }
+	for _h in $_cands; do
+		[ "$RUNNING" = 1 ] || { logw "$_if: перебор прерван по сигналу"; return 1; }
+		[ "$_tries" -ge "$MAX_TRIES" ] && break
+		_tries=$((_tries + 1))
+		log "$_if: пробую $_h"
+		apply_host "$_if" "$_h" || continue
+		bounce "$_if" || { mark_dead "$_h"; continue; }
+		if ! health_retry "$_if"; then logw "$_if: $_h не отвечает"; mark_dead "$_h"; continue; fi
+		if ! speed "$_if"; then logw "$_if: $_h медленный (${LAST_SPEED} KB/s)"; mark_dead "$_h"; continue; fi
+		mark_good "$_h"
+		log "$_if: $_h годен, ${LAST_SPEED} KB/s"
+		return 0
+	done
+	logw "$_if: ни одна страна не прошла проверку за $_tries попыток"
+	return 1
+}
+
+preflight() {
+	for _b in uci ip curl ifup ifdown logger flock sleep sort tr; do
+		command -v "$_b" >/dev/null 2>&1 || { loge "Нет утилиты '$_b'"; return 1; }
+	done
+	POOL_IFACES=""; _keys=""; _i=0
+	while [ "$_i" -lt "$POOL_N" ]; do
+		_if="$(pool_iface "$_i")"
+		valid_name "$_if" || { loge "Недопустимое имя интерфейса '$_if'"; return 1; }
+		uci -q get "network.$_if" >/dev/null 2>&1 || { loge "Интерфейс $_if отсутствует в network"; return 1; }
+		[ "$(peer_count "$_if")" = 1 ] || { loge "$_if: ожидается ровно один peer"; return 1; }
+		set_pr "$_if" ""
+		[ "$(pget "$(peer_ref "$_if")" disabled)" = 1 ] && { loge "$_if: peer выключен"; return 1; }
+		[ "$(pget "$(peer_ref "$_if")" route_allowed_ips)" = 1 ] && logw "$_if: route_allowed_ips=1 перехватит default route; для Forkop нужно 0"
+		[ -n "$(uci -q get "network.$_if.addresses")" ] || { loge "$_if: не задан addresses"; return 1; }
+		_keys="$_keys$(uci -q get "network.$_if.private_key")
+"
+		POOL_IFACES="$POOL_IFACES $_if"
+		_i=$((_i + 1))
+	done
+	[ "$(printf '%s' "$_keys" | sort -u | grep -c '^')" = "$POOL_N" ] || {
+		loge "У интерфейсов пула совпадают private_key: сервер держит одну сессию на ключ. Каждому нужен свой ключ."
+		return 1; }
+	_i=0
+	while [ "$_i" -lt "$POOL_N" ]; do
+		_if="$(pool_iface "$_i")"
+		pick_probe "$_if" || { loge "$_if: нет свободной таблицы/приоритета для проверок"; return 1; }
+		_i=$((_i + 1))
+	done
+	log "Старт v$VERSION пул:$POOL_IFACES стран=$SERVER_N порог=${MIN_SPEED_KBPS}KB/s"
+	return 0
+}
+
+acquire_lock() {
+	exec 9>"$LOCK" || die "Не открыть $LOCK"
+	flock -n 9 || { logw "Другой экземпляр работает"; exit 0; }
+}
+nap() { sleep "$1" & NAP_PID=$!; wait "$NAP_PID" 2>/dev/null; NAP_PID=""; }
+on_signal() { RUNNING=0; [ -n "$NAP_PID" ] && kill "$NAP_PID" 2>/dev/null; }
+on_exit() {
+	for _if in $POOL_IFACES; do
+		probe_down "$_if"
+		if ! ip link show dev "$_if" >/dev/null 2>&1 || [ -z "$(iface_addr "$_if")" ]; then
+			ifup "$_if" >/dev/null 2>&1
+		fi
+	done
+	return 0
+}
+
+bring_up_pool() {
+	for _if in $POOL_IFACES; do
+		if ! ip link show dev "$_if" >/dev/null 2>&1 || [ -z "$(iface_addr "$_if")" ]; then
+			ifup "$_if" >/dev/null 2>&1
+			wait_up "$_if" || { loge "$_if не поднялся"; continue; }
+		fi
+		probe_up "$_if" || loge "$_if: проверочный маршрут не создан (apk add ip-full)"
+	done
+}
+
+cmd_status() {
+	load_config || { echo "Пул не настроен: нужны >=1 секция pool и >=2 server в $CFG"; return 1; }
+	printf 'awg-pool %s\n' "$VERSION"
+	printf 'порог скорости : %s KB/s\n' "$MIN_SPEED_KBPS"
+	printf 'стран в пуле   : %s\n' "$SERVER_N"
+	_i=0
+	while [ "$_i" -lt "$POOL_N" ]; do
+		_if="$(pool_iface "$_i")"; set_pr "$_if" ""
+		printf '%-6s %-24s ipv4=%-16s table=%s\n' \
+			"$_if" "$(cur_host "$_if")" "$(iface_addr "$_if")" "$(tbl_for "$_if")"
+		_i=$((_i + 1))
+	done
+	printf 'страны:\n'
+	_i=0
+	while [ "$_i" -lt "$SERVER_N" ]; do
+		_h="$(srv_host "$_i")"
+		printf '  %-24s speed=%-8s %s\n' "$_h" \
+			"$(st_get "speed_$(host_key "$_h")")" "$(host_dead "$_h" && echo cooldown || echo ok)"
+		_i=$((_i + 1))
+	done
+	return 0
+}
+
+cmd_once() {
+	acquire_lock
+	load_config || die "Пул не настроен"
+	preflight || die "Preflight не пройден"
+	trap on_signal TERM INT
+	trap on_exit EXIT
+	bring_up_pool
+	wan_ok || { logw "WAN недоступен"; exit 0; }
+	_p="$(pool_iface 0)"
+	if health "$_p" && speed "$_p"; then
+		mark_good "$(cur_host "$_p")"; log "$_p исправен (${LAST_SPEED} KB/s)"; exit 0
+	fi
+	mark_dead "$(cur_host "$_p")"
+	rotate "$_p"; exit $?
+}
+
+cmd_rotate() {
+	acquire_lock
+	load_config || die "Пул не настроен"
+	preflight || die "Preflight не пройден"
+	trap on_signal TERM INT
+	trap on_exit EXIT
+	bring_up_pool
+	rotate "$1"; exit $?
+}
+
+cmd_daemon() {
+	QUIET=1
+	acquire_lock
+	trap on_signal TERM INT
+	trap on_exit EXIT
+	_w=0
+	while [ "$RUNNING" = 1 ]; do
+		if load_config && preflight; then break; fi
+		_w=$((_w + 1))
+		[ $((_w % 10)) = 1 ] && logw "Конфигурация не готова, жду 60 с (причина выше)"
+		nap 60
+	done
+	[ "$RUNNING" = 1 ] || { log "Остановлен до настройки"; exit 0; }
+	bring_up_pool
+	_fails=0; _cyc=0; _last_sweep=0; _sb=0
+	while [ "$RUNNING" = 1 ]; do
+		_now="$(date +%s)"; _cyc=$((_cyc + 1))
+		for _if in $POOL_IFACES; do set_pr "$_if" ""; done
+		[ $((_cyc % WAN_REFRESH_EVERY)) = 0 ] && WAN_CACHED=""
+		if [ $((_cyc % PROBE_CHECK_EVERY)) = 0 ]; then
+			for _if in $POOL_IFACES; do probe_ok "$_if" || probe_up "$_if" || true; done
+		fi
+		if ! wan_ok; then
+			logw "WAN недоступен, проверки пропущены"; _fails=0
+			nap "$CHECK_INTERVAL"; continue
+		fi
+		_p="$(pool_iface 0)"; _ok=0
+		if health "$_p"; then
+			if [ "$SPEED_EVERY" -gt 0 ] && [ $((_cyc % SPEED_EVERY)) = 0 ]; then
+				if speed "$_p"; then _ok=1; else sleep 3; speed "$_p" && _ok=1; fi
+				[ "$_ok" = 1 ] && mark_good "$(cur_host "$_p")"
+			else _ok=1; fi
+		fi
+		if [ "$_ok" = 1 ]; then
+			_fails=0
+		else
+			_fails=$((_fails + 1))
+			logw "$_p: проверка не пройдена ($_fails/$FAIL_THRESHOLD)"
+			if [ "$_fails" -ge "$FAIL_THRESHOLD" ]; then
+				if [ $((_now - _last_sweep)) -lt "$SWEEP_COOLDOWN" ]; then
+					logw "пауза перед перебором"
+				else
+					mark_dead "$(cur_host "$_p")"
+					rotate "$_p" || true
+					_last_sweep="$(date +%s)"; _fails=0
+				fi
+			fi
+		fi
+		if [ "$RUNNING" = 1 ] && [ "$POOL_N" -gt 1 ] && [ "$STANDBY_EVERY" -gt 0 ] && [ $((_cyc % STANDBY_EVERY)) = 0 ]; then
+			_sb=$((_sb + 1)); _idx=$((_sb % (POOL_N - 1) + 1)); _s="$(pool_iface "$_idx")"
+			if ! health "$_s"; then logw "резерв $_s нездоров, подбираю страну"; rotate "$_s" || true; fi
+		fi
+		nap "$CHECK_INTERVAL"
+	done
+	log "Остановлен по сигналу"
+	exit 0
+}
+
+case "${1:-}" in
+	--daemon|"") cmd_daemon ;;
+	--once) cmd_once ;;
+	--status) cmd_status ;;
+	--rotate) [ -n "${2:-}" ] || die "Использование: $0 --rotate <iface>"; cmd_rotate "$2" ;;
+	--version) echo "$VERSION" ;;
+	--help|-h) echo "awg-pool $VERSION: --daemon | --once | --status | --rotate IFACE | --version" ;;
+	*) echo "awg-pool $VERSION: --daemon | --once | --status | --rotate IFACE | --version"; exit 1 ;;
+esac

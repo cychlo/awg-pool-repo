@@ -1,0 +1,13 @@
+{
+	"admin/services/awg-pool": {
+		"title": "AWG Failover",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "awg-pool/main"
+		},
+		"depends": {
+			"acl": [ "luci-app-awg-pool" ]
+		}
+	}
+}
