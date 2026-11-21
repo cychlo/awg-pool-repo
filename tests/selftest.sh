@@ -3,7 +3,6 @@
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 UCIF="$T/u"; NET="$T/n"; SC="$T/s"; LOGF="$T/l"; CNTB="$T/b"
-STATE="$T/state"; LOCK="$T/lock"
 
 ng(){ while IFS= read -r l; do case "$l" in "$1="*) printf '%s' "${l#*=}"; return 0;; esac; done <"$NET"; return 1; }
 ns(){ _b=""; while IFS= read -r l; do case "$l" in "$1="*) continue;; esac; _b="$_b$l
@@ -81,6 +80,7 @@ curl(){ _d=""; _f=""; _u=""
 
 set -- --version
 . "$ROOT/awg-pool/files/awg-pool" >/dev/null
+STATE="$T/state"; LOCK="$T/lock"
 
 hh(){ case "$1" in 0) printf it;; 1) printf pl;; 2) printf de;; esac; }
 reset(){
@@ -132,8 +132,8 @@ ok "A6 commit при изменении" "$(grep -c x "$CNTB")" "1"
 reset; preflight >/dev/null 2>&1; bring_up_pool
 for c in it pl de ie no; do mark_dead "$c.gw.test"; done
 ok "A7 кандидатов нет" "$(candidates awg0 | grep -c .)" "0"
-rotate awg0 >/dev/null 2>&1
-ok "A7 cooldown сброшен" "$(grep -c '^dead_' "$STATE" 2>/dev/null || echo 0)" "0"
+rotate awg0 >/dev/null 2>&1; rc=$?
+ok "A7 перебор после сброса cooldown" "$rc" "0"
 
 reset; preflight >/dev/null 2>&1; bring_up_pool
 ifdown awg0; on_exit

@@ -256,7 +256,8 @@ host_dead() { _d="$(st_get "dead_$(host_key "$1")")"; [ -n "$_d" ] && [ "$_d" -g
 clear_dead() {
 	[ -f "$STATE" ] || return 0
 	_tmp="$STATE.$$"
-	grep -v '^dead_' "$STATE" > "$_tmp" 2>/dev/null && mv -f "$_tmp" "$STATE"
+	grep -v '^dead_' "$STATE" > "$_tmp" 2>/dev/null
+	mv -f "$_tmp" "$STATE" 2>/dev/null
 	rm -f "$_tmp" 2>/dev/null
 	return 0
 }

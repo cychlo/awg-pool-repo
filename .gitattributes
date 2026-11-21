@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+Makefile text eol=lf
+awg-pool/files/awg-pool text eol=lf
+awg-pool/files/awg-pool.init text eol=lf
+awg-pool/files/awg-failover.config text eol=lf
+*.apk binary

@@ -1,4 +1,9 @@
 #!/bin/sh /etc/rc.common
+# shellcheck shell=sh
+# shellcheck disable=SC2034
+# START/STOP/USE_PROCD читает /etc/rc.common (подтягивается через shebang),
+# а не этот файл. ShellCheck этого не видит, поэтому SC2034 отключён файлово.
+
 START=99
 STOP=10
 USE_PROCD=1
