@@ -1,5 +1,7 @@
 #!/bin/sh
 # Моковый стенд awg-pool. Проверяет логику без реальных uci/ip/curl.
+# Покрыты: preflight-инварианты, ротация, счётчики health/скорости (check_primary),
+# обслуживание резервов (standby_check), валидация --rotate, лимит пула.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 UCIF="$T/u"; NET="$T/n"; SC="$T/s"; LOGF="$T/l"; CNTB="$T/b"
@@ -11,7 +13,7 @@ nd(){ _b=""; while IFS= read -r l; do case "$l" in $1) continue;; esac; _b="$_b$
 "; done <"$NET"; printf '%s' "$_b" >"$NET"; }
 us(){ _b=""; while IFS= read -r l; do case "$l" in "$1="*) _b="$_b$1='$2'
 "; continue;; esac; _b="$_b$l
-"; done <"$UCIF"; printf '%s' "$_b" >"$UCIF"; }
+"; done <"$UCIF"; printf '%s%s=%s\n' "$_b" "$1" "$2" >"$UCIF"; }
 ud(){ _b=""; while IFS= read -r l; do case "$l" in $1) continue;; esac; _b="$_b$l
 "; done <"$UCIF"; printf '%s' "$_b" >"$UCIF"; }
 
@@ -59,7 +61,6 @@ logger(){ shift 4; printf '%s\n' "$*" >>"$LOGF"; return 0; }
 scg(){ while IFS= read -r l; do case "$l" in "$1="*) printf '%s' "${l#*=}"; return 0;; esac; done <"$SC"; printf '000 0'; }
 setsc(){ _b=""; while IFS= read -r l; do case "$l" in "$1="*) continue;; esac; _b="$_b$l
 "; done <"$SC"; printf '%s%s=%s\n' "$_b" "$1" "$2" >"$SC"; }
-
 curl(){ _d=""; _f=""; _u=""
  while [ $# -gt 0 ]; do case "$1" in --interface) _d="$2"; shift 2;; -w|--write-out) _f="$2"; shift 2;;
    -o|--output|--resolve|--connect-timeout|--max-time|--tls-max) shift 2;; http*) _u="$1"; shift;; *) shift;; esac; done
@@ -91,7 +92,7 @@ reset(){
      printf "network.awg%s=interface\nnetwork.awg%s.proto='amneziawg'\nnetwork.awg%s.private_key='K%s'\nnetwork.awg%s.addresses='10.0.0.%s/32'\n" "$i" "$i" "$i" "$i" "$i" "$((i+1))"
      printf "network.@amneziawg_awg%s[0]=amneziawg_awg%s\nnetwork.@amneziawg_awg%s[0].endpoint_host='%s.gw.test'\nnetwork.@amneziawg_awg%s[0].endpoint_port='443'\nnetwork.@amneziawg_awg%s[0].route_allowed_ips='0'\n" "$i" "$i" "$i" "$(hh "$i")" "$i" "$i"
    done
-   printf "awg-failover.main=settings\nawg-failover.main.check_interval='5'\nawg-failover.main.health_tries='1'\nawg-failover.main.health_retry='0'\nawg-failover.main.health_timeout='1'\nawg-failover.main.speed_bytes='100000'\nawg-failover.main.speed_every='3'\nawg-failover.main.standby_every='0'\nawg-failover.main.sweep_cooldown='0'\n"
+   printf "awg-failover.main=settings\nawg-failover.main.check_interval='5'\nawg-failover.main.health_tries='1'\nawg-failover.main.health_retry='0'\nawg-failover.main.health_timeout='1'\nawg-failover.main.speed_bytes='100000'\nawg-failover.main.speed_every='3'\nawg-failover.main.speed_fail_threshold='2'\nawg-failover.main.standby_every='0'\nawg-failover.main.sweep_cooldown='0'\nawg-failover.main.wan_urls='http://wan.test'\n"
    for i in 0 1 2; do printf "awg-failover.@pool[%s]=pool\nawg-failover.@pool[%s].iface='awg%s'\n" "$i" "$i" "$i"; done
    j=0; for c in it pl de ie no; do
      printf "awg-failover.@server[%s]=server\nawg-failover.@server[%s].host='%s.gw.test'\nawg-failover.@server[%s].port='443'\n" "$j" "$j" "$c" "$j"
@@ -99,7 +100,8 @@ reset(){
  } >"$UCIF"
  { for c in it pl de ie no; do printf '%s.gw.test=200 5000000\n' "$c"; done; } >"$SC"
  POOL=""; SERVERS=""; SPEED_IP=""; WAN_CACHED=""; POOL_IFACES=""; RUNNING=1
- for i in 0 1 2; do set_pt "awg$i" ""; set_pp "awg$i" ""; set_pr "awg$i" ""; done
+ FAILS=0; SFAILS=0; _cyc=0; _sb=0; _last_sweep=0
+ for i in 0 1 2; do set_pt "awg$i" ""; set_pp "awg$i" ""; set_pr "awg$i" ""; set_sf "awg$i" 0; done
  load_config
 }
 P=0; F=0
@@ -146,11 +148,21 @@ ok "A2 перебор прерван" "$(grep -c 'прерван по сигна
 
 reset; ud 'awg-failover.@pool*'
 load_config; ok "A3 пустой пул -> rc=1" "$?" "1"
-ok "A3 процесс жив" "alive" "alive"
+reset; preflight >/dev/null 2>&1
+ok "A3 восстановление после настройки" "$?" "0"
 
 reset; us network.awg1.private_key K0
 ( preflight ) >/dev/null 2>&1
 ok "дубли ключей отклонены" "$(grep -c 'совпадают private_key' "$LOGF")" "1"
+
+reset; us 'network.@amneziawg_awg1[0].endpoint_host' it.gw.test
+( preflight ) >/dev/null 2>&1
+ok "дубли стран отклонены на старте" "$(grep -c 'Страны пула повторяются' "$LOGF")" "1"
+
+reset
+for i in 3 4 5 6 7 8; do printf "awg-failover.@pool[%s]=pool\nawg-failover.@pool[%s].iface='awg0'\n" "$i" "$i" >>"$UCIF"; done
+load_config; ( preflight ) >/dev/null 2>&1
+ok "лимит пула (>8) отклонён" "$(grep -c 'не поддерживается' "$LOGF")" "1"
 
 reset; preflight >/dev/null 2>&1; bring_up_pool; setsc it.gw.test "000 0"
 ( cmd_once ) >/dev/null 2>&1
@@ -165,6 +177,58 @@ for c in it pl de ie no; do setsc "$c.gw.test" "000 0"; done
 ok "cross-check: ни один не отвечает" "$(pool_healthy && echo 1 || echo 0)" "0"
 setsc pl.gw.test "200 5000000"
 ok "cross-check: резерв отвечает" "$(pool_healthy && echo 1 || echo 0)" "1"
+
+# --- check_primary: независимый счётчик скорости (регрессия главного бага) ---
+reset; preflight >/dev/null 2>&1; bring_up_pool
+us awg-failover.main.speed_every 1; load_config
+setsc it.gw.test "200 102400"
+_cyc=1; check_primary; rc=$?
+ok "скорость: 1-й неудачный замер -> ждём" "$rc/$SFAILS" "0/1"
+_cyc=2; check_primary; rc=$?
+ok "скорость: 2-й замер -> перебор (порог 2)" "$rc" "1"
+
+reset; preflight >/dev/null 2>&1; bring_up_pool
+us awg-failover.main.speed_every 2; load_config
+setsc it.gw.test "200 102400"
+_cyc=2; check_primary >/dev/null 2>&1   # замер: неудача, SFAILS=1
+_cyc=3; check_primary >/dev/null 2>&1   # только health: успех
+ok "health-успех не сбрасывает счётчик скорости" "$SFAILS" "1"
+_cyc=4; check_primary; rc=$?            # замер: неудача, SFAILS=2
+ok "медленный сервер отбраковывается при speed_every>1" "$rc" "1"
+
+reset; preflight >/dev/null 2>&1; bring_up_pool
+setsc it.gw.test "000 0"
+_cyc=1; check_primary >/dev/null 2>&1; r1=$?
+_cyc=2; check_primary >/dev/null 2>&1; r2=$?
+_cyc=3; check_primary >/dev/null 2>&1; r3=$?
+ok "health: порог 3 подряд" "$r1$r2$r3" "001"
+
+# --- pick_probe не затирает переменные вызывающего ---
+reset; preflight >/dev/null 2>&1; bring_up_pool
+set_pt awg0 ""; set_pp awg0 ""
+_i=0; pick_probe awg0 >/dev/null 2>&1
+ok "pick_probe не трогает _i вызывающего" "$_i" "0"
+
+# --- валидация --rotate ---
+reset
+( cmd_rotate 'bad;name' ) >/dev/null 2>&1
+ok "rotate: недопустимое имя отвергнуто" "$(grep -c 'Недопустимое имя' "$LOGF")" "1"
+( cmd_rotate awg9 ) >/dev/null 2>&1
+ok "rotate: интерфейс не из пула отвергнут" "$(grep -c 'не входит в пул' "$LOGF")" "1"
+
+# --- резервы: порог, cross-check ---
+reset; preflight >/dev/null 2>&1; bring_up_pool
+setsc pl.gw.test "000 0"
+_sb=1; standby_check >/dev/null 2>&1
+ok "резерв: 1-я неудача без ротации" "$(cur_host awg1)" "pl.gw.test"
+_sb=1; standby_check >/dev/null 2>&1
+ok "резерв: 2-я неудача -> ротация" "$(ne "$(cur_host awg1)" pl.gw.test)" "1"
+
+reset; preflight >/dev/null 2>&1; bring_up_pool
+for c in it pl de ie no; do setsc "$c.gw.test" "000 0"; done
+_sb=1; standby_check >/dev/null 2>&1
+_sb=1; standby_check >/dev/null 2>&1
+ok "резерв: cross-check блокирует перебор" "$(cur_host awg1)" "pl.gw.test"
 
 printf '\nИТОГО PASS=%s FAIL=%s\n' "$P" "$F"
 [ "$F" = 0 ] || exit 1

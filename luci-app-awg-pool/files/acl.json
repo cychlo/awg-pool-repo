@@ -1,23 +1,24 @@
 {
-	"luci-app-awg-pool": {
-		"description": "Grant access to AWG Failover configuration and service control",
-		"read": {
-			"uci": [ "awg-failover", "network" ],
-			"file": {
-				"/usr/bin/awg-pool --status": [ "exec" ],
-				"/etc/init.d/awg-pool enabled": [ "exec" ],
-				"/etc/init.d/awg-pool running": [ "exec" ]
-			}
-		},
-		"write": {
-			"uci": [ "awg-failover" ],
-			"file": {
-				"/etc/init.d/awg-pool start": [ "exec" ],
-				"/etc/init.d/awg-pool stop": [ "exec" ],
-				"/etc/init.d/awg-pool restart": [ "exec" ],
-				"/etc/init.d/awg-pool enable": [ "exec" ],
-				"/etc/init.d/awg-pool disable": [ "exec" ]
-			}
-		}
-	}
+    "luci-app-awg-pool": {
+        "description": "Grant access to AWG Failover configuration and service control",
+        "read": {
+            "uci": [ "awg-failover" ],
+            "ubus": { "network.interface": [ "dump" ] },
+            "file": {
+                "/usr/bin/awg-pool --status": [ "exec" ],
+                "/etc/init.d/awg-pool enabled": [ "exec" ],
+                "/etc/init.d/awg-pool running": [ "exec" ]
+            }
+        },
+        "write": {
+            "uci": [ "awg-failover" ],
+            "file": {
+                "/etc/init.d/awg-pool start": [ "exec" ],
+                "/etc/init.d/awg-pool stop": [ "exec" ],
+                "/etc/init.d/awg-pool restart": [ "exec" ],
+                "/etc/init.d/awg-pool enable": [ "exec" ],
+                "/etc/init.d/awg-pool disable": [ "exec" ]
+            }
+        }
+    }
 }

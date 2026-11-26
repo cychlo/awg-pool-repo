@@ -1,9 +1,9 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=awg-pool
-PKG_VERSION:=1.2.0
+PKG_VERSION:=1.3.0
 PKG_RELEASE:=1
-PKG_LICENSE:=GPL-2.0-or-later
+PKG_LICENSE:=MIT
 PKG_MAINTAINER:=local build
 PKGARCH:=all
 
@@ -35,12 +35,12 @@ define Build/Compile
 endef
 
 define Package/awg-pool/install
-	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) ./files/awg-pool $(1)/usr/bin/awg-pool
-	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./files/awg-pool.init $(1)/etc/init.d/awg-pool
-	$(INSTALL_DIR) $(1)/etc/config
-	$(INSTALL_CONF) ./files/awg-failover.config $(1)/etc/config/awg-failover
+    $(INSTALL_DIR) $(1)/usr/bin
+    $(INSTALL_BIN) ./files/awg-pool $(1)/usr/bin/awg-pool
+    $(INSTALL_DIR) $(1)/etc/init.d
+    $(INSTALL_BIN) ./files/awg-pool.init $(1)/etc/init.d/awg-pool
+    $(INSTALL_DIR) $(1)/etc/config
+    $(INSTALL_CONF) ./files/awg-failover.config $(1)/etc/config/awg-failover
 endef
 
 define Package/awg-pool/preinst
@@ -54,13 +54,27 @@ ip rule show > "$$D/ip-rule.txt" 2>/dev/null
 cat > "$$D/restore.sh" <<'RESTORE'
 #!/bin/sh
 # Возврат endpoint'ов к состоянию до установки awg-pool.
+# Кавычки из снимка `uci show` снимаются: uci set пишет значение буквально.
 D=/etc/awg-pool
 [ -r "$$D/endpoints.txt" ] || { echo "Снимок не найден"; exit 1; }
 /etc/init.d/awg-pool stop 2>/dev/null
-while IFS= read -r line; do uci -q set "$$line" 2>/dev/null; done < "$$D/endpoints.txt"
+while IFS= read -r line; do
+    key="$${line%%=*}"; val="$${line#*=}"
+    case "$$val" in "'"*"'") val="$${val#\'}"; val="$${val%\'}" ;; esac
+    uci -q set "$$key=$$val" 2>/dev/null
+done < "$$D/endpoints.txt"
 uci commit network
-for i in 0 1 2 3 4 5; do ip rule del oif "awg$$i" 2>/dev/null; done
-for t in 250 251 252 240 241 242 9990 9991 9992; do ip route flush table "$$t" 2>/dev/null; done
+# Снимаем ТОЛЬКО проверочные правила интерфейсов пула и созданные ими таблицы.
+# Чужие таблицы/правила не трогаем; имена интерфейсов берём из конфига,
+# а не из зашитого списка awg0..awg5.
+IFACES=$$(uci -q show awg-failover 2>/dev/null | sed -n "s/^awg-failover\.@pool\[[0-9]*\]\.iface=//p" | tr -d "'")
+for i in $$IFACES; do
+    ip rule show 2>/dev/null | sed -n "s/^\([0-9][0-9]*\):.*oif $$i .*lookup \([0-9][0-9]*\).*/\1 \2/p" | \
+    while read -r pr tb; do
+        ip rule del priority "$$pr" 2>/dev/null
+        ip route flush table "$$tb" 2>/dev/null
+    done
+done
 rm -f /var/run/awg-pool.state /var/run/awg-pool.lock
 /etc/init.d/network reload
 echo "Endpoint'ы возвращены к снимку. Проверьте:"
@@ -73,13 +87,13 @@ endef
 define Package/awg-pool/postinst
 #!/bin/sh
 if [ -z "$${IPKG_INSTROOT}" ]; then
-	/etc/init.d/awg-pool enable >/dev/null 2>&1 || true
-	if uci -q get awg-failover.@pool[0] >/dev/null 2>&1 && \
-	   uci -q get awg-failover.@server[1] >/dev/null 2>&1; then
-		/etc/init.d/awg-pool start >/dev/null 2>&1 || true
-	else
-		echo "awg-pool: пул не настроен. Откройте Службы -> AWG Failover."
-	fi
+    /etc/init.d/awg-pool enable >/dev/null 2>&1 || true
+    if uci -q get awg-failover.@pool[0] >/dev/null 2>&1 && \
+       uci -q get awg-failover.@server[1] >/dev/null 2>&1; then
+        /etc/init.d/awg-pool start >/dev/null 2>&1 || true
+    else
+        echo "awg-pool: пул не настроен. Откройте Службы -> AWG Failover."
+    fi
 fi
 exit 0
 endef
@@ -87,8 +101,8 @@ endef
 define Package/awg-pool/prerm
 #!/bin/sh
 if [ -z "$${IPKG_INSTROOT}" ]; then
-	/etc/init.d/awg-pool stop >/dev/null 2>&1 || true
-	/etc/init.d/awg-pool disable >/dev/null 2>&1 || true
+    /etc/init.d/awg-pool stop >/dev/null 2>&1 || true
+    /etc/init.d/awg-pool disable >/dev/null 2>&1 || true
 fi
 exit 0
 endef

@@ -45,6 +45,12 @@ jobs:
           python3 -m json.tool luci-app-awg-pool/files/menu.json > /dev/null
           python3 -m json.tool luci-app-awg-pool/files/acl.json > /dev/null
 
+      - name: License consistency
+        run: |
+          grep -q 'MIT License' LICENSE
+          grep -q '^PKG_LICENSE:=MIT' awg-pool/Makefile
+          grep -q '^PKG_LICENSE:=MIT' luci-app-awg-pool/Makefile
+
       - name: Name consistency
         run: |
           set -e
@@ -56,6 +62,11 @@ jobs:
           grep -q '"luci-app-awg-pool"' luci-app-awg-pool/files/menu.json
           grep -q '^PKGARCH:=all' awg-pool/Makefile
           grep -q '^PKGARCH:=all' luci-app-awg-pool/Makefile
+          grep -q 'speed_fail_threshold' awg-pool/files/awg-pool
+          grep -q 'speed_fail_threshold' luci-app-awg-pool/files/main.js
+          grep -q 'wan_urls' awg-pool/files/awg-pool
+          grep -q 'wan_urls' luci-app-awg-pool/files/main.js
+          grep -q "this.super('handleSaveApply'" luci-app-awg-pool/files/main.js
           echo "consistency OK"
 
       - name: Mock selftest
