@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=awg-pool
-PKG_VERSION:=1.3.0
+PKG_VERSION:=1.3.1
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=local build
@@ -13,7 +13,7 @@ define Package/awg-pool
   SECTION:=utils
   CATEGORY:=Utilities
   TITLE:=AmneziaWG interface pool failover daemon
-  DEPENDS:=+curl +ca-bundle +ip-full +flock
+  DEPENDS:=+curl +ca-bundle +ip-full
   PKGARCH:=all
 endef
 
@@ -35,12 +35,12 @@ define Build/Compile
 endef
 
 define Package/awg-pool/install
-    $(INSTALL_DIR) $(1)/usr/bin
-    $(INSTALL_BIN) ./files/awg-pool $(1)/usr/bin/awg-pool
-    $(INSTALL_DIR) $(1)/etc/init.d
-    $(INSTALL_BIN) ./files/awg-pool.init $(1)/etc/init.d/awg-pool
-    $(INSTALL_DIR) $(1)/etc/config
-    $(INSTALL_CONF) ./files/awg-failover.config $(1)/etc/config/awg-failover
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) ./files/awg-pool $(1)/usr/bin/awg-pool
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/awg-pool.init $(1)/etc/init.d/awg-pool
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) ./files/awg-failover.config $(1)/etc/config/awg-failover
 endef
 
 define Package/awg-pool/preinst
@@ -55,11 +55,13 @@ cat > "$$D/restore.sh" <<'RESTORE'
 #!/bin/sh
 # Возврат endpoint'ов к состоянию до установки awg-pool.
 # Кавычки из снимка `uci show` снимаются: uci set пишет значение буквально.
+# Секции, которых больше нет (peer удалён или индексы сдвинулись), пропускаются.
 D=/etc/awg-pool
 [ -r "$$D/endpoints.txt" ] || { echo "Снимок не найден"; exit 1; }
 /etc/init.d/awg-pool stop 2>/dev/null
 while IFS= read -r line; do
     key="$${line%%=*}"; val="$${line#*=}"
+    uci -q get "$${key%.*}" >/dev/null 2>&1 || continue
     case "$$val" in "'"*"'") val="$${val#\'}"; val="$${val%\'}" ;; esac
     uci -q set "$$key=$$val" 2>/dev/null
 done < "$$D/endpoints.txt"
@@ -88,9 +90,10 @@ define Package/awg-pool/postinst
 #!/bin/sh
 if [ -z "$${IPKG_INSTROOT}" ]; then
     /etc/init.d/awg-pool enable >/dev/null 2>&1 || true
-    if uci -q get awg-failover.@pool[0] >/dev/null 2>&1 && \
-       uci -q get awg-failover.@server[1] >/dev/null 2>&1; then
-        /etc/init.d/awg-pool start >/dev/null 2>&1 || true
+    # restart (а не start): при обновлении пакета procd не перезапускает
+    # экземпляр с неизменившейся командой, и работал бы старый демон.
+    if uci -q get "awg-failover.@pool[0]" >/dev/null 2>&1 && uci -q get "awg-failover.@server[1]" >/dev/null 2>&1; then
+        /etc/init.d/awg-pool restart >/dev/null 2>&1 || true
     else
         echo "awg-pool: пул не настроен. Откройте Службы -> AWG Failover."
     fi

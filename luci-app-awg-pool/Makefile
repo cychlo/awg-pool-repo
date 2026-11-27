@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-awg-pool
-PKG_VERSION:=1.3.0
+PKG_VERSION:=1.3.1
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=local build
@@ -33,21 +33,23 @@ define Build/Compile
 endef
 
 define Package/luci-app-awg-pool/install
-    $(INSTALL_DIR) $(1)/www/luci-static/resources/view/awg-pool
-    $(INSTALL_DATA) ./files/main.js $(1)/www/luci-static/resources/view/awg-pool/main.js
-    $(INSTALL_DIR) $(1)/usr/share/luci/menu.d
-    $(INSTALL_DATA) ./files/menu.json $(1)/usr/share/luci/menu.d/luci-app-awg-pool.json
-    $(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
-    $(INSTALL_DATA) ./files/acl.json $(1)/usr/share/rpcd/acl.d/luci-app-awg-pool.json
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/awg-pool
+	$(INSTALL_DATA) ./files/main.js $(1)/www/luci-static/resources/view/awg-pool/main.js
+	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
+	$(INSTALL_DATA) ./files/menu.json $(1)/usr/share/luci/menu.d/luci-app-awg-pool.json
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DATA) ./files/acl.json $(1)/usr/share/rpcd/acl.d/luci-app-awg-pool.json
 endef
 
+# Как в штатном luci.mk: сбрасываем кэш LuCI и шлём rpcd сигнал HUP (перечитать
+# ACL). Полный restart rpcd/uhttpd не нужен: он разлогинивает всех пользователей
+# LuCI и обрывает соединение, если пакет ставят из самого LuCI.
 define Package/luci-app-awg-pool/postinst
 #!/bin/sh
 if [ -z "$${IPKG_INSTROOT}" ]; then
     rm -f /tmp/luci-indexcache* 2>/dev/null
     rm -rf /tmp/luci-modulecache 2>/dev/null
-    /etc/init.d/rpcd restart >/dev/null 2>&1 || true
-    /etc/init.d/uhttpd restart >/dev/null 2>&1 || true
+    killall -HUP rpcd 2>/dev/null
 fi
 exit 0
 endef
@@ -57,7 +59,7 @@ define Package/luci-app-awg-pool/prerm
 if [ -z "$${IPKG_INSTROOT}" ]; then
     rm -f /tmp/luci-indexcache* 2>/dev/null
     rm -rf /tmp/luci-modulecache 2>/dev/null
-    /etc/init.d/rpcd restart >/dev/null 2>&1 || true
+    killall -HUP rpcd 2>/dev/null
 fi
 exit 0
 endef

@@ -6,6 +6,14 @@
 'require ui';
 'require rpc';
 
+/* LuCI: Службы -> AWG Failover.
+ *
+ * Перезапуск демона при «Save & Apply» делает не этот файл, а procd-триггер
+ * из /etc/init.d/awg-pool (service_triggers + reload_service): штатный
+ * `uci apply` сам вызывает reload службы после фиксации конфигурации.
+ * Ручной fs.exec(restart) из JS гонялся с фиксацией и перезагружал страницу
+ * посреди применения, поэтому стандартное сохранение не переопределяется. */
+
 /* Список интерфейсов берём из network.interface dump (ubus), а не из UCI
  * network: чтение UCI network выдавало бы в браузер приватные ключи всех
  * WireGuard/AWG peer'ов любому пользователю с этой ACL. */
@@ -15,20 +23,9 @@ var ifaceDump = rpc.declare({
     expect: {}
 });
 
-return view.extend({
-    handleSaveApply: function(ev, mode) {
-        /* LuCI API: super(id, args). Вызов this.super(ev, mode) искал метод
-         * с именем-объектом события, возвращал null и ронял .then. */
-        return this.super('handleSaveApply', [ev, mode]).then(function() {
-            return fs.exec('/etc/init.d/awg-pool', ['restart']);
-        }).then(function() {
-            ui.addNotification(null, E('p', {}, _('Настройки применены, служба перезапущена.')), 'info');
-            window.setTimeout(function() { window.location.reload(); }, 1500);
-        }).catch(function(e) {
-            ui.addNotification(null, E('p', {}, e.message), 'danger');
-        });
-    },
+var POOL_MAX = 8;
 
+return view.extend({
     load: function() {
         return Promise.all([
             uci.load('awg-failover'),
@@ -99,7 +96,9 @@ return view.extend({
 
         var m = new form.Map('awg-failover', _('Настройки демона'));
 
-        var s = m.section(form.NamedSection, 'main', _('Параметры проверок и таймингов'),
+        /* NamedSection: (section_id, section_type, title, description).
+         * Тип секции в /etc/config/awg-failover -- 'settings'. */
+        var s = m.section(form.NamedSection, 'main', 'settings', _('Параметры проверок и таймингов'),
             _('Пустое поле = значение по умолчанию из скрипта. Save & Apply перезапускает службу.'));
         s.anonymous = true;
         s.addremove = false;
@@ -130,7 +129,7 @@ return view.extend({
         num('fail_threshold', _('Неудач health до перебора'), 3, 1, 20,
             _('Время обнаружения ≈ интервал × это число.'));
         num('speed_fail_threshold', _('Неудачных замеров скорости до перебора'), 2, 1, 10,
-            _('Считаются только замеры (раз в speed_every циклов); успешный health между ними счётчик не сбрасывает.'));
+            _('Считаются только замеры (раз в speed_every циклов); успешный health между ними счётчик не сбрасывает. Замер, который не состоялся (узел замера недоступен), не считается неудачей.'));
         num('health_timeout', _('Таймаут HTTPS, с'), 5, 1, 60,
             _('Таймаут соединения; общий лимит запроса вдвое больше.'));
         num('health_tries', _('Попыток HTTPS после подъёма'), 3, 1, 10);
@@ -144,18 +143,19 @@ return view.extend({
         hu.placeholder = 'https://8.8.8.8/resolve?name=example.com&type=A\nhttps://8.8.4.4/resolve?name=example.com&type=A\nhttps://1.1.1.1/cdn-cgi/trace';
 
         var wu = s.option(form.TextValue, 'wan_urls', _('Адреса проверки WAN (без туннеля)'),
-            _('Отдельный список для проверки голом WAN: health_urls могут быть заблокированы провайдером без туннеля, и это не должно останавливать демон. По умолчанию — captive-portal проверки по HTTP (нужен рабочий DNS на WAN).'));
+            _('Отдельный список для проверки голого WAN: health_urls могут быть заблокированы провайдером без туннеля, и это не должно останавливать демон. По умолчанию — captive-portal проверки по HTTP (нужен рабочий DNS на WAN). Отсутствие default-маршрута в main тоже считается отказом WAN.'));
         wu.rows = 3;
         wu.optional = true;
         wu.rmempty = true;
         wu.placeholder = 'http://www.msftconnecttest.com/connecttest.txt\nhttp://detectportal.firefox.com/success.txt';
 
+        /* TLS 1.0/1.1 убраны из списка: современные сборки curl (OpenSSL 3 /
+         * mbedTLS 3) такой потолок обычно отвергают, и все HTTPS-проверки
+         * падали бы. Демон по-прежнему принимает эти значения из UCI. */
         var tm = s.option(form.ListValue, 'tls_max', _('Максимальная версия TLS'),
             _('DPI в РФ часто ломает TLS 1.3 — значение 1.2 решает это. «Без ограничения» = curl согласует максимум.'));
         tm.value('1.2', 'TLS 1.2 (рекомендуется для РФ)');
         tm.value('1.3', 'TLS 1.3');
-        tm.value('1.1', 'TLS 1.1');
-        tm.value('1.0', 'TLS 1.0');
         tm.value('auto', 'Без ограничения');
         tm.optional = true;
         tm.rmempty = true;
@@ -192,7 +192,8 @@ return view.extend({
 
         num('sweep_cooldown', _('Пауза между переборами, с'), 90, 0, 86400,
             _('Защищает интерфейсы от «дёрганья». Для резервов считается отдельно по каждому интерфейсу.'));
-        num('dead_ttl', _('Cooldown отказавшей страны, с'), 600, 0, 86400);
+        num('dead_ttl', _('Cooldown отказавшей страны, с'), 600, 0, 86400,
+            _('0 = без cooldown: отказавшая страна сразу снова может быть выбрана.'));
         num('standby_every', _('Проверка резерва раз в N циклов'), 15, 0, 10000,
             _('0 = выключить обслуживание резервов. Работает при ≥2 интерфейсах в пуле. Перебор резерва — после 2 неудач подряд, с cross-check и cooldown.'));
         num('max_tries', _('Стран за один перебор, максимум'), 4, 1, 50);
@@ -200,8 +201,13 @@ return view.extend({
             _('Больше значение — меньше нагрузка на CPU. Маршруты пересоздаются сразу после подъёма интерфейса.'));
         num('wan_refresh_every', _('Обновление WAN-устройства раз в N циклов'), 15, 1, 1000);
 
-        var p = m.section(form.TypedSection, 'pool', _('Интерфейсы пула'),
-            _('Количество секций = количество занятых AWG-слотов (не более 8). Порядок = приоритет: первая — рабочий интерфейс, остальные — резервы. В группу Fallback в Forkop добавляйте в том же порядке. У каждого интерфейса: свой ключ, свой Address, своя страна, ровно один peer.'));
+        /* TableSection: перетаскивание (sortable) работает только в табличных
+         * секциях; порядок строк = приоритет интерфейсов пула. */
+        var pdescr = _('Количество секций = количество занятых AWG-слотов (не более 8). Порядок = приоритет: первая — рабочий интерфейс, остальные — резервы; меняйте порядок перетаскиванием. В группу Fallback в Forkop добавляйте в том же порядке. У каждого интерфейса: свой ключ, свой Address, своя страна, ровно один peer.');
+        if (!ifaces.length)
+            pdescr += ' ' + _('AWG-интерфейсы не найдены. Создайте их в Сеть → Интерфейсы с протоколом AmneziaWG VPN.');
+
+        var p = m.section(form.TableSection, 'pool', _('Интерфейсы пула'), pdescr);
         p.addremove = true;
         p.anonymous = true;
         p.sortable = true;
@@ -209,10 +215,24 @@ return view.extend({
         var pi = p.option(form.ListValue, 'iface', _('Интерфейс'));
         ifaces.forEach(function(n) { pi.value(n); });
         pi.optional = false;
-        if (!ifaces.length)
-            pi.description = _('AWG-интерфейсы не найдены. Создайте их в Сеть → Интерфейсы с протоколом AmneziaWG VPN.');
+        /* без повторов и не больше POOL_MAX: иначе демон отклонит конфигурацию
+         * (совпадут private_key) и ошибка будет видна только в логе */
+        pi.validate = function(section_id, value) {
+            if (!value)
+                return true;
+            var self = this, dup = false, ids = this.section.cfgsections();
+            ids.forEach(function(sid) {
+                if (sid !== section_id && self.formvalue(sid) === value)
+                    dup = true;
+            });
+            if (dup)
+                return _('Этот интерфейс уже добавлен в пул');
+            if (ids.length > POOL_MAX)
+                return _('В пуле не более ') + POOL_MAX + _(' интерфейсов');
+            return true;
+        };
 
-        var v = m.section(form.TypedSection, 'server', _('Страны / серверы'),
+        var v = m.section(form.TableSection, 'server', _('Страны / серверы'),
             _('Минимум две. Скрипт не даст членам пула сесть на одну страну (проверка и на старте, и при ротации). Добавление стран не увеличивает число слотов.'));
         v.addremove = true;
         v.anonymous = true;

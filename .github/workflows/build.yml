@@ -2,6 +2,7 @@ name: build-apk
 
 # Пакеты PKGARCH:=all (скрипт + JS), от таргета не зависят: собираем один раз.
 # Матрица из двух таргетов давала одинаковые .apk с одинаковыми именами в релизе.
+# Один и тот же noarch-пакет подходит и aarch64_cortex-a53, и aarch64_generic.
 on:
   workflow_dispatch:
     inputs:
@@ -17,7 +18,7 @@ jobs:
     env:
       TARGET: mediatek/filogic
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build deps
         run: |
@@ -28,20 +29,27 @@ jobs:
 
       - name: Resolve SDK URL
         id: sdk
+        env:
+          INPUT_VER: ${{ github.event.inputs.openwrt_version }}
         run: |
           set -e
-          VER="${{ github.event.inputs.openwrt_version || '25.12.6' }}"
+          VER="${INPUT_VER:-25.12.6}"
+          case "$VER" in *[!0-9A-Za-z._-]*) echo "bad version: $VER"; exit 1 ;; esac
           BASE="https://downloads.openwrt.org/releases/$VER/targets/$TARGET"
           NAME=$(curl -fsSL "$BASE/" | grep -oE 'openwrt-sdk-[^"<>]*Linux-x86_64\.tar\.(zst|xz)' | head -n1)
           if [ -z "$NAME" ]; then echo "SDK not found at $BASE"; exit 1; fi
-          echo "url=$BASE/$NAME" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "file=$NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Download and unpack SDK
+      - name: Download, verify and unpack SDK
         run: |
           set -e
-          curl -fL -o sdk.tar "${{ steps.sdk.outputs.url }}"
-          mkdir sdk && tar -xf sdk.tar -C sdk --strip-components=1
+          BASE="${{ steps.sdk.outputs.base }}"
+          FILE="${{ steps.sdk.outputs.file }}"
+          curl -fL -o "$FILE" "$BASE/$FILE"
+          curl -fsSL -o sha256sums "$BASE/sha256sums"
+          grep -F "$FILE" sha256sums | sha256sum -c -
+          mkdir sdk && tar -xf "$FILE" -C sdk --strip-components=1
 
       - name: Feeds
         run: |

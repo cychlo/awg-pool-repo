@@ -1,6 +1,6 @@
 #!/bin/sh
 # =============================================================================
-# awg-pool 1.3 -- пул AWG-интерфейсов OpenWrt: ротация стран по скорости
+# awg-pool 1.3.1 -- пул AWG-интерфейсов OpenWrt: ротация стран по скорости
 # OpenWrt 25.12.x, Forkop 2.0 (группа Fallback над интерфейсами секции)
 #
 # Forkop Fallback -- доступность и мгновенное переключение между интерфейсами
@@ -16,10 +16,15 @@
 #     от ложного отказа при блокировке проверочных адресов через DPI)
 #   * медленный, но живой сервер отбраковывается по НЕЗАВИСИМОМУ счётчику
 #     неудачных замеров скорости: health-успех его не сбрасывает
+#   * недоступность узла замера скорости (код 000 / ошибка HTTP) -- это НЕ
+#     «медленный сервер»: такой замер пропускается и счётчик не увеличивает
 #   * WAN проверяется отдельными адресами (wan_urls), не health_urls:
-#     блокировка DoH-адресов на голом WAN не останавливает демон
+#     блокировка DoH-адресов на голом WAN не останавливает демон;
+#     отсутствие default-маршрута в main -- отказ WAN
+#   * если перебор не нашёл годной страны, интерфейсу возвращается прежняя
+#   * при старте снимаются устаревшие проверочные правила прошлых запусков
 # =============================================================================
-VERSION="1.3"
+VERSION="1.3.1"
 CFG="awg-failover"
 LOG_TAG="awg-pool"
 
@@ -49,11 +54,15 @@ WAN_REFRESH_EVERY=15
 STATE="/var/run/awg-pool.state"
 LOCK="/var/run/awg-pool.lock"
 POOL_MAX=8   # проверочных приоритетов ровно 8 (200..221), лимит размера пула
+PROBE_TABLES="250 251 252 240 241 242 9990 9991 9992"
+PROBE_PRIOS="200 201 202 210 211 212 220 221"
 
 POOL=""; POOL_N=0; SERVERS=""; SERVER_N=0; POOL_IFACES=""
 SPEED_IP=""; WAN_CACHED=""; RUNNING=1; NAP_PID=""; QUIET=0; LAST_SPEED=0
 FAILS=0; SFAILS=0
 TLS_FLAGS="--tls-max 1.2"
+ROTATE_EXCL_SELF=0   # 1 -- ручной --rotate: текущую страну интерфейса не выбирать
+CFG_REASON=""        # причина, по которой load_config вернул 1 (пул не настроен)
 
 _lg() {
     logger -t "$LOG_TAG" -p "daemon.$1" "$3" 2>/dev/null
@@ -65,6 +74,9 @@ loge() { _lg err ERROR "$*"; }
 die() { loge "$*"; exit 1; }
 is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 valid_name() { case "$1" in ''|*[!A-Za-z0-9_]*) return 1 ;; *) return 0 ;; esac; }
+# host из конфига попадает в uci batch: только безопасные символы (имя, IPv4, IPv6)
+valid_host() { case "$1" in ''|*[!A-Za-z0-9._:-]*) return 1 ;; *) return 0 ;; esac; }
+valid_port() { is_num "$1" && [ "${#1}" -le 5 ] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 
 sections_of() { uci -q show "$1" 2>/dev/null | sed -n "s/^$1\.\(.*\)=$2\$/\1/p"; }
 nth() { printf '%s\n' "$1" | sed -n "$(($2 + 1))p"; }
@@ -73,6 +85,7 @@ pget() { uci -q get "network.$1.$2" 2>/dev/null; }
 sget() { uci -q get "$CFG.$1.$2" 2>/dev/null; }
 
 load_config() {
+    CFG_REASON=""
     if uci -q get "$CFG.main" >/dev/null 2>&1; then
         for _p in CHECK_INTERVAL:check_interval FAIL_THRESHOLD:fail_threshold \
                   SPEED_FAIL_THRESHOLD:speed_fail_threshold \
@@ -89,11 +102,19 @@ load_config() {
             [ -n "$_val" ] && eval "$_v=\$_val"
         done
     fi
-    for _n in $CHECK_INTERVAL $FAIL_THRESHOLD $SPEED_FAIL_THRESHOLD $HEALTH_TIMEOUT \
-              $HEALTH_TRIES $HEALTH_RETRY $SPEED_EVERY $SPEED_BYTES $SPEED_WINDOW \
-              $MIN_SPEED_KBPS $SWEEP_COOLDOWN $DEAD_TTL $STANDBY_EVERY $MAX_TRIES \
-              $PROBE_CHECK_EVERY $WAN_REFRESH_EVERY $CROSS_CHECK; do
-        is_num "$_n" || { loge "Некорректное число в $CFG.main: '$_n'"; return 1; }
+    # Числа: только цифры, не длиннее 9 знаков; ведущие нули срезаются
+    # (в арифметике busybox ash «08» трактуется как неверное восьмеричное).
+    for _nv in CHECK_INTERVAL FAIL_THRESHOLD SPEED_FAIL_THRESHOLD HEALTH_TIMEOUT \
+               HEALTH_TRIES HEALTH_RETRY SPEED_EVERY SPEED_BYTES SPEED_WINDOW \
+               MIN_SPEED_KBPS SWEEP_COOLDOWN DEAD_TTL STANDBY_EVERY MAX_TRIES \
+               PROBE_CHECK_EVERY WAN_REFRESH_EVERY CROSS_CHECK; do
+        eval "_nval=\$$_nv"
+        if ! is_num "$_nval" || [ "${#_nval}" -gt 9 ]; then
+            loge "Некорректное число в $CFG.main ($_nv): '$_nval'"
+            return 1
+        fi
+        _nval="$(printf '%s' "$_nval" | sed 's/^0*\([0-9]\)/\1/')"
+        eval "$_nv=\$_nval"
     done
     case "$TLS_MAX" in
         auto|1.0|1.1|1.2|1.3) : ;;
@@ -109,15 +130,23 @@ load_config() {
     fi
     TLS_FLAGS=""
     [ "$TLS_MAX" = auto ] || TLS_FLAGS="--tls-max $TLS_MAX"
+    # Нижние границы: значения 0 через `uci set` (мимо LuCI) ломали бы логику
+    # (health_tries=0 -- ни одна страна не проходит проверку, max_tries=0 --
+    # ни одна не пробуется, speed_window/health_timeout=0 -- «без лимита» в curl).
     [ "$CHECK_INTERVAL" -ge 5 ] || CHECK_INTERVAL=5
     [ "$FAIL_THRESHOLD" -ge 1 ] || FAIL_THRESHOLD=1
     [ "$SPEED_FAIL_THRESHOLD" -ge 1 ] || SPEED_FAIL_THRESHOLD=1
+    [ "$HEALTH_TIMEOUT" -ge 1 ] || HEALTH_TIMEOUT=1
+    [ "$HEALTH_TRIES" -ge 1 ] || HEALTH_TRIES=1
+    [ "$MAX_TRIES" -ge 1 ] || MAX_TRIES=1
+    [ "$SPEED_WINDOW" -ge 2 ] || SPEED_WINDOW=2
+    [ "$SPEED_BYTES" -ge 100000 ] || SPEED_BYTES=100000
     [ "$PROBE_CHECK_EVERY" -ge 1 ] || PROBE_CHECK_EVERY=1
     [ "$WAN_REFRESH_EVERY" -ge 1 ] || WAN_REFRESH_EVERY=1
     POOL="$(sections_of "$CFG" pool)"; POOL_N="$(count_lines "$POOL")"
     SERVERS="$(sections_of "$CFG" server)"; SERVER_N="$(count_lines "$SERVERS")"
-    [ "$POOL_N" -ge 1 ] || return 1
-    [ "$SERVER_N" -ge 2 ] || return 1
+    [ "$POOL_N" -ge 1 ] || { CFG_REASON="не задано ни одной секции pool"; return 1; }
+    [ "$SERVER_N" -ge 2 ] || { CFG_REASON="нужно минимум две секции server"; return 1; }
     return 0
 }
 
@@ -133,6 +162,7 @@ peer_type() {
 }
 # Кэш PR_* наполняется вызывающим в основной оболочке (set_pr "$if" "$(peer_ref "$if")"),
 # т.к. сам peer_ref всегда вызывается через $(...) и его присваивания не переживают subshell.
+# Кэш заполняется в preflight; смена/переименование peer-секций требует перезапуска службы.
 set_pr() { eval "PR_$1=\$2"; }
 get_pr() { eval "printf '%s' \"\${PR_$1:-}\""; }
 peer_ref() {
@@ -163,27 +193,34 @@ get_pp() { eval "printf '%s' \"\${PP_$1:-}\""; }
 set_sf() { eval "SF_$1=\$2"; }
 get_sf() { eval "printf '%s' \"\${SF_$1:-0}\""; }
 
+# Есть ли правило «oif $1 lookup $2» (с границей слова: awg1 != awg10, 25 != 250)
+rule_has() { ip rule show 2>/dev/null | grep -Eq "oif $1[[:space:]].*lookup $2([[:space:]]|\$)"; }
+
 # Все счётчики/переменные pick_probe имеют префикс _pk_: функция вызывается
 # напрямую (не через $(...)) и не должна затирать переменные вызывающего.
+# Таблица и приоритет выбираются независимо: если одно из значений уже есть,
+# а второго нет, дочищается только недостающее.
 pick_probe() {
     _pkif="$1"
-    [ -n "$(get_pt "$_pkif")" ] && return 0
-    _pkused="$( { cat /etc/iproute2/rt_tables 2>/dev/null; cat /etc/iproute2/rt_tables.d/* 2>/dev/null; } | awk '$1 ~ /^[0-9]+$/ {print $1}' )"
-    _pki=0
-    while [ "$_pki" -lt "$POOL_N" ]; do
-        _pko="$(pool_iface "$_pki")"
-        [ "$_pko" = "$_pkif" ] || _pkused="$_pkused
+    if [ -z "$(get_pt "$_pkif")" ]; then
+        _pkused="$( { cat /etc/iproute2/rt_tables 2>/dev/null; cat /etc/iproute2/rt_tables.d/* 2>/dev/null; } | awk '$1 ~ /^[0-9]+$/ {print $1}' )"
+        _pki=0
+        while [ "$_pki" -lt "$POOL_N" ]; do
+            _pko="$(pool_iface "$_pki")"
+            [ "$_pko" = "$_pkif" ] || _pkused="$_pkused
 $(get_pt "$_pko")"
-        _pki=$((_pki + 1))
-    done
-    for _pkt in 250 251 252 240 241 242 9990 9991 9992; do
-        printf '%s\n' "$_pkused" | grep -qx "$_pkt" && continue
-        [ -n "$(ip route show table "$_pkt" 2>/dev/null)" ] && continue
-        set_pt "$_pkif" "$_pkt"; break
-    done
-    [ -n "$(get_pt "$_pkif")" ] || return 1
+            _pki=$((_pki + 1))
+        done
+        for _pkt in $PROBE_TABLES; do
+            printf '%s\n' "$_pkused" | grep -qx "$_pkt" && continue
+            [ -n "$(ip route show table "$_pkt" 2>/dev/null)" ] && continue
+            set_pt "$_pkif" "$_pkt"; break
+        done
+        [ -n "$(get_pt "$_pkif")" ] || return 1
+    fi
+    [ -n "$(get_pp "$_pkif")" ] && return 0
     _pkrules="$(ip rule show 2>/dev/null)"
-    for _pkp in 200 201 202 210 211 212 220 221; do
+    for _pkp in $PROBE_PRIOS; do
         printf '%s\n' "$_pkrules" | grep -q "^$_pkp:" && continue
         _pki=0; _pktaken=0
         while [ "$_pki" -lt "$POOL_N" ]; do
@@ -196,12 +233,30 @@ $(get_pt "$_pko")"
     done
     return 1
 }
+# Снимает проверочные правила/таблицы интерфейсов пула, оставшиеся от прошлых
+# запусков (SIGKILL, OOM, падение). Трогаются ТОЛЬКО правила с нашими
+# приоритетами и нашими таблицами: чужая политика маршрутизации не затрагивается.
+probe_cleanup() {
+    for _pcif in $POOL_IFACES; do
+        # список правил снимается ДО удаления: не читаем и не меняем таблицу правил одновременно
+        _pcrules="$(ip rule show 2>/dev/null)"
+        printf '%s\n' "$_pcrules" | sed -n "s/^\([0-9][0-9]*\):.*oif $_pcif .*lookup \([0-9][0-9]*\).*/\1 \2/p" | \
+        while read -r _pcp _pct; do
+            case " $PROBE_PRIOS " in *" $_pcp "*) : ;; *) continue ;; esac
+            case " $PROBE_TABLES " in *" $_pct "*) : ;; *) continue ;; esac
+            ip rule del oif "$_pcif" lookup "$_pct" priority "$_pcp" 2>/dev/null
+            ip route flush table "$_pct" 2>/dev/null
+        done
+    done
+    return 0
+}
 probe_up() {
     _qupif="$1"; pick_probe "$_qupif" || return 1
     _qupt="$(get_pt "$_qupif")"; _qupp="$(get_pp "$_qupif")"; _qupa="$(iface_addr "$_qupif")"
     [ -n "$_qupa" ] || return 1
+    [ -n "$_qupp" ] || return 1
     ip route replace default dev "$_qupif" src "$_qupa" table "$_qupt" 2>/dev/null || return 1
-    if ! ip rule show 2>/dev/null | grep -q "oif $_qupif .*lookup $_qupt"; then
+    if ! rule_has "$_qupif" "$_qupt"; then
         ip rule del oif "$_qupif" lookup "$_qupt" 2>/dev/null
         ip rule add oif "$_qupif" lookup "$_qupt" priority "$_qupp" 2>/dev/null || return 1
     fi
@@ -217,8 +272,8 @@ probe_down() {
 probe_ok() {
     _qoif="$1"; _qot="$(get_pt "$_qoif")"
     [ -n "$_qot" ] || return 1
-    ip rule show 2>/dev/null | grep -q "oif $_qoif .*lookup $_qot" || return 1
-    ip route show table "$_qot" 2>/dev/null | grep -q "dev $_qoif" || return 1
+    rule_has "$_qoif" "$_qot" || return 1
+    ip route show table "$_qot" 2>/dev/null | grep -Eq "dev $_qoif([[:space:]]|\$)" || return 1
     return 0
 }
 
@@ -237,9 +292,10 @@ wan_refresh() {
 # set -f вокруг циклов по URL: в адресах есть '?', исключаем globbing
 wan_ok() {
     _wok="$(wan_dev)"
-    # нет default-маршрута в main: возможно, default ушёл в туннель (Forkop) --
-    # не считаем это отказом WAN
-    [ -n "$_wok" ] || return 0
+    # Нет default-маршрута в main -- это упавший WAN (кабель, PPPoE, ранняя
+    # загрузка), а не «default ушёл в туннель»: туннельный случай ниже
+    # распознаётся по имени устройства из POOL_IFACES.
+    [ -n "$_wok" ] || return 1
     case " $POOL_IFACES " in *" $_wok "*) return 0 ;; esac
     set -f; _worc=1
     for _wou in $WAN_URLS; do
@@ -283,6 +339,12 @@ speed_ip_refresh() {
     case "$_srip" in *.*.*.*) SPEED_IP="$_srip"; return 0 ;; esac
     return 1
 }
+# Коды возврата speed:
+#   0 -- замер выполнен, скорость >= порога
+#   1 -- замер выполнен, сервер МЕДЛЕННЫЙ (или передано 0 байт при HTTP 200)
+#   2 -- замер НЕ СОСТОЯЛСЯ: узел замера недоступен/заблокирован (код 000, нет
+#        вывода curl) или ответил HTTP-ошибкой. Это не вина проверяемой страны:
+#        вызывающий не должен ни увеличивать счётчик, ни бракуровать страну.
 speed() {
     [ -n "$SPEED_IP_FIXED" ] && SPEED_IP="$SPEED_IP_FIXED"
     [ -n "$SPEED_IP" ] || speed_ip_refresh || true
@@ -301,7 +363,7 @@ speed() {
         # узел замера недоступен: сбрасываем кэш IP, чтобы следующий замер
         # заново определил адрес (устаревший IP не должен «убивать» все страны)
         [ -n "$SPEED_IP_FIXED" ] || SPEED_IP=""
-        return 1
+        return 2
     fi
     _spc="$1"; _sps="${2%%.*}"; _spz="${3%%.*}"
     case "$_sps" in ''|*[!0-9]*) _sps=0 ;; esac
@@ -309,10 +371,11 @@ speed() {
     LAST_SPEED=$((_sps / 1024))
     if [ "$_spc" != 200 ]; then
         [ "$_spc" = 000 ] && [ -z "$SPEED_IP_FIXED" ] && SPEED_IP=""
-        return 1
+        return 2
     fi
     [ "$_spz" -gt 0 ] || return 1
-    [ "$LAST_SPEED" -ge "$MIN_SPEED_KBPS" ]
+    [ "$LAST_SPEED" -ge "$MIN_SPEED_KBPS" ] || return 1
+    return 0
 }
 
 st_get() { [ -f "$STATE" ] && sed -n "s/^$1=//p" "$STATE" 2>/dev/null | head -n1; }
@@ -323,6 +386,9 @@ st_set() {
 }
 host_key() { printf '%s' "$1" | tr '.' '_'; }
 mark_good() { st_set "speed_$(host_key "$1")" "$LAST_SPEED"; st_set "dead_$(host_key "$1")" 0; }
+# Страна годна по health, но скорость измерить не удалось: cooldown снимаем,
+# сохранённую скорость не трогаем.
+mark_ok_nospeed() { st_set "dead_$(host_key "$1")" 0; }
 mark_dead() { st_set "dead_$(host_key "$1")" "$(( $(date +%s) + DEAD_TTL ))"; }
 host_dead() { _hd="$(st_get "dead_$(host_key "$1")")"; [ -n "$_hd" ] && [ "$_hd" -gt "$(date +%s)" ]; }
 clear_dead() {
@@ -336,9 +402,12 @@ clear_dead() {
 
 candidates() {
     _cexcl="$(used_hosts "$1")"; _ci=0; _clist=""; _cnow="$(date +%s)"
+    # ручной --rotate обязан сменить страну: текущая исключается всегда
+    [ "$ROTATE_EXCL_SELF" = 1 ] && _cexcl="$_cexcl
+$(cur_host "$1")"
     while [ "$_ci" -lt "$SERVER_N" ]; do
         _ch="$(srv_host "$_ci")"
-        if [ -n "$_ch" ] && ! printf '%s\n' "$_cexcl" | grep -qx "$_ch"; then
+        if [ -n "$_ch" ] && valid_host "$_ch" && ! printf '%s\n' "$_cexcl" | grep -qx "$_ch"; then
             _cd="$(st_get "dead_$(host_key "$_ch")")"
             if [ -z "$_cd" ] || [ "$_cd" -le "$_cnow" ]; then
                 _csc="$(st_get "speed_$(host_key "$_ch")")"
@@ -353,23 +422,30 @@ candidates() {
     return 0
 }
 
+# Запись endpoint'а в UCI. Значения проверяются ДО попадания в `uci batch`:
+# перевод строки в port/host добавил бы произвольную команду set от root.
+apply_endpoint() {
+    _aeif="$1"; _aeh="$2"; _aep="$3"; _aer="$(peer_ref "$_aeif")"
+    [ -n "$_aer" ] || return 1
+    valid_host "$_aeh" || { loge "$_aeif: недопустимый endpoint '$_aeh'"; return 1; }
+    valid_port "$_aep" || { loge "$_aeif: недопустимый порт '$_aep' ($_aeh)"; return 1; }
+    if [ "$(pget "$_aer" endpoint_host)" = "$_aeh" ] && \
+       [ "$(pget "$_aer" endpoint_port)" = "$_aep" ] && \
+       [ "$(pget "$_aer" disabled)" != 1 ]; then
+        return 0
+    fi
+    { printf 'set network.%s.endpoint_host=%s\n' "$_aer" "$_aeh"
+      printf 'set network.%s.endpoint_port=%s\n' "$_aer" "$_aep"
+      printf 'set network.%s.disabled=0\n' "$_aer"
+      printf 'commit network\n'; } | uci -q batch >/dev/null 2>&1
+}
 apply_host() {
-    _ahif="$1"; _ahh="$2"; _ahr="$(peer_ref "$_ahif")"; _ahp=443
-    [ -n "$_ahr" ] || return 1
-    _ahi=0
+    _ahif="$1"; _ahh="$2"; _ahp=443; _ahi=0
     while [ "$_ahi" -lt "$SERVER_N" ]; do
         [ "$(srv_host "$_ahi")" = "$_ahh" ] && _ahp="$(srv_port "$_ahi")"
         _ahi=$((_ahi + 1))
     done
-    if [ "$(pget "$_ahr" endpoint_host)" = "$_ahh" ] && \
-       [ "$(pget "$_ahr" endpoint_port)" = "$_ahp" ] && \
-       [ "$(pget "$_ahr" disabled)" != 1 ]; then
-        return 0
-    fi
-    { printf 'set network.%s.endpoint_host=%s\n' "$_ahr" "$_ahh"
-      printf 'set network.%s.endpoint_port=%s\n' "$_ahr" "$_ahp"
-      printf 'set network.%s.disabled=0\n' "$_ahr"
-      printf 'commit network\n'; } | uci -q batch >/dev/null 2>&1
+    apply_endpoint "$_ahif" "$_ahh" "$_ahp"
 }
 wait_up() {
     _wuk=0
@@ -393,8 +469,22 @@ bounce() {
     probe_ok "$1"
 }
 
+# Возврат интерфейса на прежнюю страну, если перебор не нашёл годной:
+# иначе интерфейс остался бы на последнем проверенном, заведомо нерабочем хосте.
+rotate_restore() {
+    [ -n "$2" ] || return 0
+    [ "$(cur_host "$1")" = "$2" ] && return 0
+    logw "$1: возвращаю прежнюю страну $2"
+    apply_endpoint "$1" "$2" "$3" || return 1
+    [ "$RUNNING" = 1 ] || return 0
+    bounce "$1" || true
+    return 0
+}
+
 rotate() {
     _rif="$1"; _rtries=0
+    _roh="$(cur_host "$_rif")"
+    _rop="$(pget "$(peer_ref "$_rif")" endpoint_port)"; [ -n "$_rop" ] || _rop=443
     _rcands="$(candidates "$_rif")"
     if [ -z "$_rcands" ]; then
         logw "$_rif: свободных стран нет, сбрасываю cooldown"
@@ -403,19 +493,27 @@ rotate() {
     fi
     [ -n "$_rcands" ] || { logw "$_rif: список стран пуст"; return 1; }
     for _rh in $_rcands; do
-        [ "$RUNNING" = 1 ] || { logw "$_rif: перебор прерван по сигналу"; return 1; }
+        [ "$RUNNING" = 1 ] || { rotate_restore "$_rif" "$_roh" "$_rop"; logw "$_rif: перебор прерван по сигналу"; return 1; }
         [ "$_rtries" -ge "$MAX_TRIES" ] && break
         _rtries=$((_rtries + 1))
         log "$_rif: пробую $_rh"
         apply_host "$_rif" "$_rh" || continue
         bounce "$_rif" || { mark_dead "$_rh"; continue; }
         if ! health_retry "$_rif"; then logw "$_rif: $_rh не отвечает"; mark_dead "$_rh"; continue; fi
-        if ! speed "$_rif"; then logw "$_rif: $_rh медленный (${LAST_SPEED} KB/s)"; mark_dead "$_rh"; continue; fi
-        mark_good "$_rh"
-        log "$_rif: $_rh годен, ${LAST_SPEED} KB/s"
-        return 0
+        speed "$_rif"; _rsp=$?
+        case "$_rsp" in
+            0) mark_good "$_rh"
+               log "$_rif: $_rh годен, ${LAST_SPEED} KB/s"
+               return 0 ;;
+            2) mark_ok_nospeed "$_rh"
+               logw "$_rif: $_rh отвечает, но замер скорости не состоялся (узел замера недоступен) -- принят по health"
+               return 0 ;;
+            *) logw "$_rif: $_rh медленный (${LAST_SPEED} KB/s)"
+               mark_dead "$_rh" ;;
+        esac
     done
     logw "$_rif: ни одна страна не прошла проверку за $_rtries попыток"
+    rotate_restore "$_rif" "$_roh" "$_rop"
     return 1
 }
 
@@ -451,6 +549,15 @@ preflight() {
         loge "Страны пула повторяются (одинаковый endpoint_host). Задайте интерфейсам разные страны."
         return 1; }
     _pfi=0
+    while [ "$_pfi" -lt "$SERVER_N" ]; do
+        valid_host "$(srv_host "$_pfi")" || logw "server #$_pfi: недопустимый host, страна пропускается"
+        valid_port "$(srv_port "$_pfi")" || logw "server #$_pfi: недопустимый port ($(srv_host "$_pfi"))"
+        _pfi=$((_pfi + 1))
+    done
+    # Снимаем правила/таблицы, оставшиеся после аварийного завершения прошлого
+    # запуска, иначе они навсегда занимают приоритеты и таблицы.
+    probe_cleanup
+    _pfi=0
     while [ "$_pfi" -lt "$POOL_N" ]; do
         _pfif="$(pool_iface "$_pfi")"
         pick_probe "$_pfif" || { loge "$_pfif: нет свободной таблицы/приоритета для проверок"; return 1; }
@@ -460,11 +567,22 @@ preflight() {
     return 0
 }
 
+# acquire_lock [manual]: в режиме manual (--once/--rotate) занятая блокировка --
+# ошибка (код 2): команда НЕ выполнена, потому что работает служба.
 acquire_lock() {
     exec 9>"$LOCK" || die "Не открыть $LOCK"
-    flock -n 9 || { logw "Другой экземпляр работает"; exit 0; }
+    if ! flock -n 9; then
+        if [ "${1:-}" = manual ]; then
+            loge "Работает служба awg-pool и держит блокировку: команда не выполнена. Остановите службу (/etc/init.d/awg-pool stop) и повторите."
+            exit 2
+        fi
+        logw "Другой экземпляр работает"
+        exit 0
+    fi
 }
-nap() { sleep "$1" & NAP_PID=$!; wait "$NAP_PID" 2>/dev/null; NAP_PID=""; }
+# 9>&- : дочерний sleep не должен наследовать дескриптор блокировки, иначе
+# после SIGKILL демона осиротевший sleep держал бы lock до конца паузы.
+nap() { sleep "$1" 9>&- & NAP_PID=$!; wait "$NAP_PID" 2>/dev/null; NAP_PID=""; }
 on_signal() { RUNNING=0; [ -n "$NAP_PID" ] && kill "$NAP_PID" 2>/dev/null; }
 on_exit() {
     for _if in $POOL_IFACES; do
@@ -491,20 +609,23 @@ bring_up_pool() {
 #   SFAILS -- неудачные ЗАМЕРЫ СКОРОСТИ (порог SPEED_FAIL_THRESHOLD);
 #             health-успех между замерами его НЕ сбрасывает -- иначе при
 #             speed_every>1 медленный сервер никогда не отбраковывался бы.
+#             Замер, который не состоялся (speed вернул 2), счётчик не меняет.
 # Возврат: 0 -- всё в порядке/ждём, 1 -- пора перебирать страну.
 check_primary() {
     _cpif="$(pool_iface 0)"
     if health "$_cpif"; then
         FAILS=0
         if [ "$SPEED_EVERY" -gt 0 ] && [ $((_cyc % SPEED_EVERY)) = 0 ]; then
-            if speed "$_cpif" || { sleep 3; speed "$_cpif"; }; then
-                mark_good "$(cur_host "$_cpif")"
-                SFAILS=0
-            else
-                SFAILS=$((SFAILS + 1))
-                logw "$_cpif: скорость ниже порога (${LAST_SPEED} KB/s), $SFAILS/$SPEED_FAIL_THRESHOLD"
-                [ "$SFAILS" -ge "$SPEED_FAIL_THRESHOLD" ] && return 1
-            fi
+            speed "$_cpif"; _cps=$?
+            if [ "$_cps" = 1 ]; then sleep 3; speed "$_cpif"; _cps=$?; fi
+            case "$_cps" in
+                0) mark_good "$(cur_host "$_cpif")"
+                   SFAILS=0 ;;
+                2) logw "$_cpif: замер скорости не состоялся (узел замера недоступен), пропуск" ;;
+                *) SFAILS=$((SFAILS + 1))
+                   logw "$_cpif: скорость ниже порога (${LAST_SPEED} KB/s), $SFAILS/$SPEED_FAIL_THRESHOLD"
+                   [ "$SFAILS" -ge "$SPEED_FAIL_THRESHOLD" ] && return 1 ;;
+            esac
         fi
         return 0
     fi
@@ -544,7 +665,7 @@ standby_check() {
 }
 
 cmd_status() {
-    load_config || { echo "Пул не настроен: нужны >=1 секция pool и >=2 server в $CFG"; return 1; }
+    load_config || { echo "Пул не настроен: ${CFG_REASON:-нужны >=1 секция pool и >=2 server} ($CFG)"; return 1; }
     printf 'awg-pool %s\n' "$VERSION"
     printf 'порог скорости : %s KB/s\n' "$MIN_SPEED_KBPS"
     printf 'макс. TLS      : %s\n' "$TLS_MAX"
@@ -569,7 +690,7 @@ cmd_status() {
 }
 
 cmd_once() {
-    acquire_lock
+    acquire_lock manual
     load_config || die "Пул не настроен"
     preflight || die "Preflight не пройден"
     trap on_signal TERM INT
@@ -577,8 +698,12 @@ cmd_once() {
     bring_up_pool
     wan_ok || { logw "WAN недоступен"; exit 0; }
     _op="$(pool_iface 0)"
-    if health "$_op" && speed "$_op"; then
-        mark_good "$(cur_host "$_op")"; log "$_op исправен (${LAST_SPEED} KB/s)"; exit 0
+    if health "$_op"; then
+        speed "$_op"; _ops=$?
+        case "$_ops" in
+            0) mark_good "$(cur_host "$_op")"; log "$_op исправен (${LAST_SPEED} KB/s)"; exit 0 ;;
+            2) log "$_op исправен (замер скорости не состоялся: узел замера недоступен)"; exit 0 ;;
+        esac
     fi
     if [ "$CROSS_CHECK" = 1 ] && [ "$POOL_N" -gt 1 ] && ! pool_healthy; then
         logw "Ни один интерфейс пула не отвечает. Вероятна блокировка проверочных адресов или отказ WAN — перебор пропущен. Проверьте health_urls и tls_max."
@@ -590,7 +715,7 @@ cmd_once() {
 
 cmd_rotate() {
     valid_name "$1" || die "Недопустимое имя интерфейса '$1'"
-    acquire_lock
+    acquire_lock manual
     load_config || die "Пул не настроен"
     _cri=0; _crfound=0
     while [ "$_cri" -lt "$POOL_N" ]; do
@@ -602,6 +727,7 @@ cmd_rotate() {
     trap on_signal TERM INT
     trap on_exit EXIT
     bring_up_pool
+    ROTATE_EXCL_SELF=1
     rotate "$1"; exit $?
 }
 
@@ -614,7 +740,7 @@ cmd_daemon() {
     while [ "$RUNNING" = 1 ]; do
         if load_config && preflight; then break; fi
         _w=$((_w + 1))
-        [ $((_w % 10)) = 1 ] && logw "Конфигурация не готова, жду 60 с (причина выше)"
+        [ $((_w % 10)) = 1 ] && logw "Конфигурация не готова: ${CFG_REASON:-см. сообщения выше}; жду 60 с"
         nap 60
     done
     [ "$RUNNING" = 1 ] || { log "Остановлен до настройки"; exit 0; }
@@ -622,7 +748,6 @@ cmd_daemon() {
     _cyc=0; _last_sweep=0; _sb=0; FAILS=0; SFAILS=0
     while [ "$RUNNING" = 1 ]; do
         _cyc=$((_cyc + 1))
-        for _if in $POOL_IFACES; do set_pr "$_if" "$(peer_ref "$_if")"; done
         if [ -z "$WAN_CACHED" ] || [ $((_cyc % WAN_REFRESH_EVERY)) = 0 ]; then
             wan_refresh
         fi
@@ -630,7 +755,7 @@ cmd_daemon() {
             for _if in $POOL_IFACES; do probe_ok "$_if" || probe_up "$_if" || true; done
         fi
         if ! wan_ok; then
-            logw "WAN недоступен, проверки пропущены (проверьте wan_urls)"
+            logw "WAN недоступен (нет default-маршрута или не отвечают wan_urls), проверки пропущены"
             FAILS=0; SFAILS=0
             nap "$CHECK_INTERVAL"; continue
         fi

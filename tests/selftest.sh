@@ -1,7 +1,9 @@
 #!/bin/sh
 # Моковый стенд awg-pool. Проверяет логику без реальных uci/ip/curl.
-# Покрыты: preflight-инварианты, ротация, счётчики health/скорости (check_primary),
-# обслуживание резервов (standby_check), валидация --rotate, лимит пула.
+# Покрыты: preflight-инварианты, ротация (в т.ч. откат на прежнюю страну),
+# счётчики health/скорости (check_primary), недоступный узел замера скорости,
+# обслуживание резервов (standby_check), валидация --rotate и порта, лимит пула,
+# чистка устаревших проверочных правил, WAN без default-маршрута, нормализация чисел.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 UCIF="$T/u"; NET="$T/n"; SC="$T/s"; LOGF="$T/l"; CNTB="$T/b"
@@ -38,7 +40,7 @@ ip(){ while [ "$1" = "-4" ] || [ "$1" = "-o" ]; do shift; done
  route) _s="$1"; shift; _t=main; _d=""; _src=""
    while [ $# -gt 0 ]; do case "$1" in table) _t="$2"; shift 2;; dev) _d="$2"; shift 2;; src) _src="$2"; shift 2;; *) shift;; esac; done
    case "$_s" in
-   show) [ "$_t" = main ] && printf 'default via 192.168.1.1 dev %s\n' "$(ng wan)"
+   show) [ "$_t" = main ] && [ "$(ng nodefault)" != 1 ] && printf 'default via 192.168.1.1 dev %s\n' "$(ng wan)"
      while IFS= read -r l; do case "$l" in "route=$_t "*) printf '%s\n' "${l#route=$_t }";; esac; done <"$NET";;
    replace|add) nd "route=$_t *dev $_d*"; printf 'route=%s default dev %s src %s table %s\n' "$_t" "$_d" "$_src" "$_t" >>"$NET";;
    flush) nd "route=$_t *";; esac; return 0;;
@@ -71,7 +73,9 @@ curl(){ _d=""; _f=""; _u=""
  if [ "$(ng "up_$_d")" != 1 ] || [ "$_hr" != 1 ] || [ "$_ht" != 1 ]; then _e 000 0 0; return 7; fi
  _h="$(uci -q get "network.@amneziawg_$_d[0].endpoint_host")"
  set -- $(scg "$_h"); _c="$1"; _sp="$2"
- case "$_u" in *__down*) _wn="${_u##*bytes=}"
+ case "$_u" in *__down*)
+   [ "$(ng speed_down)" = 1 ] && { _e 000 0 0; return 7; }
+   _wn="${_u##*bytes=}"
    [ "$_sp" -le 0 ] && { _e "$_c" 0 0; return 28; }
    _ms=$((_wn*1000/_sp))
    if [ "$_ms" -gt 8000 ]; then _sz=$((_sp*8)); _ms=8000; _rc=28; else _sz="$_wn"; _rc=0; fi
@@ -85,7 +89,7 @@ STATE="$T/state"; LOCK="$T/lock"
 
 hh(){ case "$1" in 0) printf it;; 1) printf pl;; 2) printf de;; esac; }
 reset(){
- { printf 'wan=eth0\nwan_down=0\n'
+ { printf 'wan=eth0\nwan_down=0\nnodefault=0\nspeed_down=0\n'
    for i in 0 1 2; do printf 'up_awg%s=1\naddr_awg%s=10.0.0.%s\nbak_awg%s=10.0.0.%s\n' "$i" "$i" "$((i+1))" "$i" "$((i+1))"; done; } >"$NET"
  : >"$LOGF"; : >"$CNTB"; rm -f "$STATE"
  { for i in 0 1 2; do
@@ -100,7 +104,7 @@ reset(){
  } >"$UCIF"
  { for c in it pl de ie no; do printf '%s.gw.test=200 5000000\n' "$c"; done; } >"$SC"
  POOL=""; SERVERS=""; SPEED_IP=""; WAN_CACHED=""; POOL_IFACES=""; RUNNING=1
- FAILS=0; SFAILS=0; _cyc=0; _sb=0; _last_sweep=0
+ FAILS=0; SFAILS=0; _cyc=0; _sb=0; _last_sweep=0; ROTATE_EXCL_SELF=0
  for i in 0 1 2; do set_pt "awg$i" ""; set_pp "awg$i" ""; set_pr "awg$i" ""; set_sf "awg$i" 0; done
  load_config
 }
@@ -148,6 +152,7 @@ ok "A2 перебор прерван" "$(grep -c 'прерван по сигна
 
 reset; ud 'awg-failover.@pool*'
 load_config; ok "A3 пустой пул -> rc=1" "$?" "1"
+ok "A3 причина указана" "$(ne "$CFG_REASON" "")" "1"
 reset; preflight >/dev/null 2>&1
 ok "A3 восстановление после настройки" "$?" "0"
 
@@ -229,6 +234,90 @@ for c in it pl de ie no; do setsc "$c.gw.test" "000 0"; done
 _sb=1; standby_check >/dev/null 2>&1
 _sb=1; standby_check >/dev/null 2>&1
 ok "резерв: cross-check блокирует перебор" "$(cur_host awg1)" "pl.gw.test"
+
+# =========================== новые проверки (1.3.1) ===========================
+
+# WAN: отсутствие default-маршрута в main -- отказ WAN
+reset; preflight >/dev/null 2>&1; bring_up_pool
+ns nodefault 1; WAN_CACHED=""
+wan_ok; rc=$?
+ok "wan_ok: нет default-маршрута -> отказ" "$rc" "1"
+ns nodefault 0; WAN_CACHED=""
+wan_ok; rc=$?
+ok "wan_ok: default есть -> исправен" "$rc" "0"
+
+# Недоступный узел замера скорости != медленный сервер
+reset; preflight >/dev/null 2>&1; bring_up_pool; ns speed_down 1
+speed awg0 >/dev/null 2>&1; rc=$?
+ok "speed: узел замера недоступен -> код 2" "$rc" "2"
+us awg-failover.main.speed_every 1; load_config
+_cyc=1; check_primary >/dev/null 2>&1; rc=$?
+ok "check_primary: несостоявшийся замер не считается неудачей" "$rc/$SFAILS" "0/0"
+_cyc=2; check_primary >/dev/null 2>&1; rc=$?
+ok "check_primary: и повторно перебор не запускается" "$rc/$SFAILS" "0/0"
+
+reset; preflight >/dev/null 2>&1; bring_up_pool; ns speed_down 1
+setsc it.gw.test "000 0"
+rotate awg0 >/dev/null 2>&1; rc=$?
+ok "rotate: страна годна по health, замер не состоялся -> принята" "$rc/$(ne "$(cur_host awg0)" it.gw.test)" "0/1"
+
+# Откат на прежнюю страну, если перебор ничего не нашёл
+reset; preflight >/dev/null 2>&1; bring_up_pool
+setsc ie.gw.test "000 0"; setsc no.gw.test "000 0"
+mark_dead it.gw.test
+rotate awg0 >/dev/null 2>&1; rc=$?
+ok "rotate: все кандидаты отказали -> прежняя страна возвращена" "$rc/$(cur_host awg0)" "1/it.gw.test"
+ok "rotate: после отката интерфейс поднят" "$(ng up_awg0)" "1"
+
+# Ручной --rotate исключает текущую страну
+reset; preflight >/dev/null 2>&1; bring_up_pool
+ROTATE_EXCL_SELF=1; C="$(candidates awg0 | tr '\n' ' ')"; ROTATE_EXCL_SELF=0
+ok "--rotate: текущая страна исключена из кандидатов" "$(has it.gw.test "$C")" "0"
+
+# Устаревшие правила после аварийного завершения чистятся при старте
+reset; preflight >/dev/null 2>&1; bring_up_pool
+ok "до аварии: 3 правила" "$(grep -c '^rule=' "$NET")" "3"
+for i in 0 1 2; do set_pt "awg$i" ""; set_pp "awg$i" ""; done   # «новый процесс»
+preflight >/dev/null 2>&1
+ok "старт: устаревшие проверочные правила сняты" "$(grep -c '^rule=' "$NET")" "0"
+ok "старт: таблица снова 250" "$(get_pt awg0)" "250"
+
+# Чужие правила на интерфейсе пула не трогаются (чужой приоритет)
+reset; preflight >/dev/null 2>&1
+printf 'rule=300 awg0 777\n' >>"$NET"
+for i in 0 1 2; do set_pt "awg$i" ""; set_pp "awg$i" ""; done
+preflight >/dev/null 2>&1
+ok "старт: чужое правило не удалено" "$(grep -c '^rule=300 awg0 777' "$NET")" "1"
+
+# pick_probe: приоритет назначается, даже если таблица уже выбрана
+reset; preflight >/dev/null 2>&1; bring_up_pool
+set_pp awg0 ""; pick_probe awg0 >/dev/null 2>&1
+ok "pick_probe: приоритет назначен при выбранной таблице" "$(ne "$(get_pp awg0)" "")" "1"
+
+# Нормализация чисел и нижние границы
+reset
+us awg-failover.main.check_interval 008; us awg-failover.main.health_tries 0
+us awg-failover.main.max_tries 0; us awg-failover.main.speed_window 0
+load_config
+ok "ведущие нули: 008 -> 8" "$CHECK_INTERVAL" "8"
+ok "health_tries=0 поднят до 1" "$HEALTH_TRIES" "1"
+ok "max_tries=0 поднят до 1" "$MAX_TRIES" "1"
+ok "speed_window=0 поднят до 2" "$SPEED_WINDOW" "2"
+us awg-failover.main.check_interval 12x
+load_config >/dev/null 2>&1; rc=$?
+ok "нечисловое значение отклонено" "$rc" "1"
+
+# Некорректный порт не попадает в uci batch
+reset; preflight >/dev/null 2>&1; bring_up_pool; : >"$CNTB"
+us 'awg-failover.@server[1].port' abc
+apply_host awg0 pl.gw.test >/dev/null 2>&1; rc=$?
+ok "apply_host: некорректный порт отвергнут" "$rc/$(grep -c x "$CNTB")" "1/0"
+us 'awg-failover.@server[1].port' 99999
+apply_host awg0 pl.gw.test >/dev/null 2>&1; rc=$?
+ok "apply_host: порт вне диапазона отвергнут" "$rc/$(grep -c x "$CNTB")" "1/0"
+valid_host 'a.b-c_d:1' ; ok "valid_host: допустимое имя" "$?" "0"
+valid_host 'a b' ; ok "valid_host: пробел недопустим" "$?" "1"
+valid_host "$(printf 'a\nset x=1')" ; ok "valid_host: перевод строки недопустим" "$?" "1"
 
 printf '\nИТОГО PASS=%s FAIL=%s\n' "$P" "$F"
 [ "$F" = 0 ] || exit 1
