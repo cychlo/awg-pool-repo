@@ -43,7 +43,6 @@ jobs:
           dash -n tests/selftest.sh
 
       - name: Shell syntax (busybox ash, как на роутере)
-        continue-on-error: true
         run: |
           busybox sh -n awg-pool/files/awg-pool
           busybox sh -n tests/selftest.sh
@@ -91,5 +90,4 @@ jobs:
         run: dash tests/selftest.sh
 
       - name: Mock selftest (busybox ash)
-        continue-on-error: true
         run: busybox sh tests/selftest.sh
